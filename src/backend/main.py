@@ -118,7 +118,7 @@ def _get_frames(ra: float, dec: float, size: float, detector=None, mode="best", 
             mode=mode, group_id=group_id,
         )
         json_path.write_text(json.dumps(result))
-		json_path.write_text(json.dumps(result))
+        json_path.write_text(json.dumps(result))
         trim_live_frames()
         return result
     finally:
