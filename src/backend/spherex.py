@@ -46,7 +46,9 @@ from astropy.time import Time
 from astropy.utils.data import conf
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
-from astroquery.ipac.irsa import Irsa
+from astropy.nddata import Cutout2D
+from urllib.parse import parse_qs, urlsplit
+import archive_access
 from PIL import Image
 from reproject import reproject_interp
 
@@ -60,7 +62,7 @@ conf.remote_timeout = 120
 IRSA_BASE = "https://irsa.ipac.caltech.edu/"
 MIN_SIZE_DEG = 0.01        # field of view limits (the FOV slider's range)
 MAX_SIZE_DEG = 0.30        # larger = more pixels to download and reproject
-MAX_CANDIDATES = 80        # cutouts downloaded per request (spread evenly over time)
+MAX_CANDIDATES = 24        # cutouts downloaded per request (spread evenly over time)
 MAX_FRAMES = 20            # frames returned to the frontend
 GROUP_GAP_FRAC = 0.004     # new wavelength group when sorted neighbours differ by more than 0.4%.
 GROUP_MAX_SPAN_FRAC = 0.006  # ...or when a group would span more than 0.6% (stops chaining).
@@ -69,8 +71,8 @@ GROUP_MAX_SPAN_FRAC = 0.006  # ...or when a group would span more than 0.6% (sto
 EPOCH_GAP_DAYS = 10.0      # frames closer than this (chained) belong to one epoch (one survey visit)
 BASELINE_BUCKET_DAYS = 30  # baselines within the same 30-day bucket count as a tie when ranking
 MODES = ("best", "group", "stack", "all")
-MAX_WORKERS = 10           # IRSA tutorial suggests 7-12 parallel requests
-RETRY_WORKERS = 3          # second pass for failed cutouts uses fewer parallel requests (gentler on IRSA)
+MAX_WORKERS = 3           # IRSA tutorial suggests 7-12 parallel requests
+RETRY_WORKERS = 2          # second pass for failed cutouts uses fewer parallel requests (gentler on IRSA)
 MAX_RETRIES = 3            # IRSA's tutorial saw transient failures on a noticeable share of cutouts
 OVERSAMPLE = 2             # output pixels per native pixel (helps sub-pixel motion look smooth)
 STRETCH_PERCENTILES = (1.0, 99.0)
@@ -192,43 +194,17 @@ def search_images(ra, dec, size_deg, detector=None) -> list[ImageRef]:
     metadata tables already contain them, so no release name is hard-coded here.
     """
     ra, dec, size_deg, detector = validate_request(ra, dec, size_deg, detector)
-    det_clause = f"AND p.energy_bandpassname = 'SPHEREx-D{detector}'" if detector else ""
-    # `p.energy_bandpassname AS bandpass` in the SELECT is UNVERIFIED (the tutorial only uses it in WHERE).
-    # If it errors on the first live run, delete it: the detector is then parsed from the file name.
-    query = f"""
-    SELECT
-        '{IRSA_BASE}' || a.uri || '?center={ra:.8f},{dec:.8f}d&size={size_deg:.6g}' AS uri,
-        p.time_bounds_lower,
-        p.energy_bandpassname AS bandpass
-    FROM spherex.artifact a
-    JOIN spherex.plane p ON a.planeid = p.planeid
-    WHERE 1 = CONTAINS(POINT('ICRS', {ra:.8f}, {dec:.8f}), p.poly)
-        {det_clause}
-    ORDER BY p.time_bounds_lower
-    """
-    t0 = time.time()
     try:
-        table = Irsa.query_tap(query).to_table()
-    except Exception as exc:  # network, TAP syntax, service down...
-        raise UpstreamError(f"IRSA TAP query failed: {exc}") from exc
-    log.info("TAP query: %d images in %.1f s", len(table), time.time() - t0)
-
-    has_band = "bandpass" in table.colnames
+        rows, source, notes = archive_access.discover(ra, dec, size_deg, detector)
+    except archive_access.ArchiveUnavailable as exc:
+        raise UpstreamError(str(exc)) from exc
     refs = []
-    for row in table:
-        mjd = float(row["time_bounds_lower"])
-        if not np.isfinite(mjd):
-            continue
-        uri = str(row["uri"])
-        rel = re.search(r"/spherex/([^/]+)/level2/", uri)
-        refs.append(ImageRef(
-            uri=uri,
-            mjd=mjd,
-            detector=_parse_detector(row["bandpass"] if has_band else None, uri),
-            release=rel.group(1) if rel else "unknown",
-            file_id=uri.split("?")[0].rsplit("/", 1)[-1],
-        ))
-    refs.sort(key=lambda r: r.mjd)
+    for row in rows:
+        ref = ImageRef(**{k: row[k] for k in ['uri','mjd','detector','release','file_id']})
+        ref.catalog_source = source
+        ref.discovery_warnings = notes
+        ref.local_file = row.get('local_file')
+        refs.append(ref)
     return refs
 
 
@@ -236,7 +212,8 @@ def search_images(ra, dec, size_deg, detector=None) -> list[ImageRef]:
 def _read_cutout(ref: ImageRef, coord: SkyCoord) -> Cutout:
     """Download one cutout. Mirrors process_cutout() in the IRSA notebook."""
     # HDUs: 0 primary (no data), then IMAGE, FLAGS, VARIANCE, ZODI, EPSF, WCS-WAVE.
-    with fits.open(ref.uri, cache=False) as hdul:
+    path, access_source, needs_crop = archive_access.obtain(ref)
+    with fits.open(path, memmap=False) as hdul:
         image_hdu = hdul["IMAGE"]
         header = image_hdu.header
         image = np.array(image_hdu.data, dtype=np.float32)   # native byte order, own memory
@@ -255,7 +232,15 @@ def _read_cutout(ref: ImageRef, coord: SkyCoord) -> Cutout:
         wavelength_um = float(wavelength.to(u.micrometer).value)
 
         version = str(hdul[0].header.get("VERSION", ""))
-    return Cutout(ref, image, flags, spatial_wcs, wavelength_um, version)
+    if needs_crop:
+        size = float(parse_qs(urlsplit(ref.uri).query).get('size', ['0.05'])[0])
+        crop = Cutout2D(image, coord, size*u.deg, wcs=spatial_wcs, mode='partial', fill_value=np.nan)
+        if flags is not None:
+            flags = Cutout2D(flags, coord, size*u.deg, wcs=spatial_wcs, mode='partial', fill_value=0).data
+        image, spatial_wcs = crop.data, crop.wcs
+    result = Cutout(ref, image, flags, spatial_wcs, wavelength_um, version)
+    result.access_source = access_source
+    return result
 
 
 def fetch_cutout(ref: ImageRef, coord: SkyCoord, retries: int = MAX_RETRIES) -> Cutout | None:
@@ -264,6 +249,10 @@ def fetch_cutout(ref: ImageRef, coord: SkyCoord, retries: int = MAX_RETRIES) -> 
     for attempt in range(retries + 1):
         try:
             return _read_cutout(ref, coord)
+        except archive_access.ArchiveUnavailable as exc:
+            # The adapter already tried both transports with bounded retries.
+            log.warning('cutout %s unavailable: %s', ref.file_id, exc)
+            return None
         except TRANSIENT_ERRORS as exc:
             last = exc
             if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500:
@@ -500,6 +489,8 @@ def build_frames_from_cutouts(frame_sets, ra, dec, size_deg, out_dir, url_prefix
             "release": ",".join(sorted({c.ref.release for c in members})),
             "file_id": members[0].ref.file_id,
             "file_ids": [c.ref.file_id for c in members],
+            "data_sources": sorted({getattr(c, 'access_source', 'unknown') for c in members}),
+            "source_urls": [c.ref.uri for c in members],
             "image_url": f"{url_prefix.rstrip('/')}/{name}" if url_prefix else name,
             "valid_frac": round(float(np.isfinite(arr).mean()), 4),
             "flagged_frac": round(float(np.mean(flag_vals)), 4) if flag_vals else None,
@@ -555,7 +546,11 @@ def build_frames(ra, dec, size_deg=0.05, detector=None, out_dir="static/frames/t
     frame_sets, selected = select_frames(groups, cutouts, mode, group_id, max_frames)
     result = build_frames_from_cutouts(frame_sets, ra, dec, size_deg, out_dir, url_prefix, **build_kw)
 
-    warnings_out = []
+    warnings_out = list(dict.fromkeys(note for ref in refs for note in getattr(ref, 'discovery_warnings', [])))
+    if len(refs) > len(candidates):
+        warnings_out.append(f'Using {len(candidates)} time-spaced candidates from {len(refs)} discovered exposures.')
+    result['meta']['catalog_sources'] = sorted({getattr(ref, 'catalog_source', 'unknown') for ref in refs})
+    result['meta']['download_sources'] = sorted({getattr(c, 'access_source', 'unknown') for c in cutouts})
     if mode == "all":
         warnings_out.append("mode 'all' mixes wavelengths: brightness changes may be colour, not motion")
     if n_failed:

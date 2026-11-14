@@ -95,3 +95,6 @@ Append two lines per task: what changed, where, any new constraint.
 - 2026-11-14: `/frames` route, `/demo` and `/static` mounts, `/presets`, cache-first `/frames`. Constraint: presets need `demo_cache/` committed.
 - 2026-11-14: `/overlay`, live frames cache, sexagesimal input, live-build limit (503), live-folder cleanup. Constraint: overlay uses Gaia only.
 - 2026-11-14: Presets still not precomputed because IRSA TAP and SIA2 returned 502 or connection resets.
+
+Added standalone src/observatory dashboard and resilient IRSA TAP/SIA, NASA S3 and verified-cache access in src/backend/archive_access.py.
+Live discovery can still fail upstream; bundled M101 PNGs are labelled mixed-wavelength samples, and optional raw FITS seeds are checksum-verified and excluded from Git.

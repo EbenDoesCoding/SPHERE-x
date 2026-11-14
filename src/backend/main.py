@@ -6,7 +6,8 @@ from overlay import build_overlay
 from pathlib import Path
 from presets import DEMO_DIR, find_preset_frames, list_presets
 from fastapi.staticfiles import StaticFiles
-from spherex import SpherexError, build_frames
+from spherex import SpherexError, build_frames, validate_request, BadRequest, MODES
+from archive_access import atomic_json
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -70,7 +71,7 @@ async def unexpected_error_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "archive_access": "TAP + SIA + NASA S3 + verified local cache"}
 
 
 @app.get("/resolve")
@@ -90,6 +91,9 @@ def _get_stars(ra: float, dec: float, size_arcmin: float) -> list[dict]:
     return stars
 
 def _get_frames(ra: float, dec: float, size: float, detector=None, mode="best", group_id=None) -> dict:
+    ra, dec, size, detector = validate_request(ra, dec, size, detector)
+    if mode not in MODES or (mode == 'group' and group_id is None):
+        raise BadRequest('Invalid mode or missing group_id')
     # Presets were built with default options, so only use them for default requests
     if detector is None and mode == "best" and group_id is None:
         preset = find_preset_frames(ra, dec, size)
@@ -117,8 +121,7 @@ def _get_frames(ra: float, dec: float, size: float, detector=None, mode="best", 
             ra, dec, size, detector, out_dir, f"/static/frames/{folder}",
             mode=mode, group_id=group_id,
         )
-        json_path.write_text(json.dumps(result))
-        json_path.write_text(json.dumps(result))
+        atomic_json(json_path, result)
         trim_live_frames()
         return result
     finally:

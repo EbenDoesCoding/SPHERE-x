@@ -4,7 +4,6 @@ import math
 import time
 
 import numpy as np
-from astroquery.gaia import Gaia
 
 MAX_STARS = 200
 
@@ -18,6 +17,8 @@ def _clean(value):
 
 def _run_query(query: str, attempts: int = 3, delay: float = 3.0):
     """Run a Gaia query, retrying on connection errors."""
+    # Import only for Gaia requests: its status lookup must not delay API startup or image access.
+    from astroquery.gaia import Gaia
     for attempt in range(1, attempts + 1):
         try:
             return Gaia.launch_job(query).get_results()

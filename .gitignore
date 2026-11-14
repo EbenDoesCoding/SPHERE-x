@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Observatory archive downloads and runtime files
+archive_cache/
+node_modules/

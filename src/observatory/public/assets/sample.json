@@ -1,0 +1,161 @@
+{
+  "request": {
+    "ra": 133.79513,
+    "dec": -7.24515,
+    "size_deg": 0.05
+  },
+  "grid": {
+    "width": 59,
+    "height": 59
+  },
+  "frames": [
+    {
+      "index": 0,
+      "t_mjd": 60801.1066,
+      "t_iso": "2025-05-06T02:33:30.240Z",
+      "detector": 5,
+      "wavelength_um": 4.2964,
+      "image_url": "assets/frames/00_D5_60801.1066.png"
+    },
+    {
+      "index": 1,
+      "t_mjd": 60801.1081,
+      "t_iso": "2025-05-06T02:35:39.839Z",
+      "detector": 5,
+      "wavelength_um": 4.3332,
+      "image_url": "assets/frames/01_D5_60801.1081.png"
+    },
+    {
+      "index": 2,
+      "t_mjd": 60801.1096,
+      "t_iso": "2025-05-06T02:37:49.440Z",
+      "detector": 5,
+      "wavelength_um": 4.3703,
+      "image_url": "assets/frames/02_D5_60801.1096.png"
+    },
+    {
+      "index": 3,
+      "t_mjd": 60986.8567,
+      "t_iso": "2025-11-07T20:33:38.879Z",
+      "detector": 5,
+      "wavelength_um": 4.2228,
+      "image_url": "assets/frames/03_D5_60986.8567.png"
+    },
+    {
+      "index": 4,
+      "t_mjd": 60986.9212,
+      "t_iso": "2025-11-07T22:06:31.679Z",
+      "detector": 5,
+      "wavelength_um": 4.2951,
+      "image_url": "assets/frames/04_D5_60986.9212.png"
+    },
+    {
+      "index": 5,
+      "t_mjd": 60986.9227,
+      "t_iso": "2025-11-07T22:08:41.280Z",
+      "detector": 5,
+      "wavelength_um": 4.3318,
+      "image_url": "assets/frames/05_D5_60986.9227.png"
+    },
+    {
+      "index": 6,
+      "t_mjd": 60986.9242,
+      "t_iso": "2025-11-07T22:10:50.880Z",
+      "detector": 5,
+      "wavelength_um": 4.3686,
+      "image_url": "assets/frames/06_D5_60986.9242.png"
+    },
+    {
+      "index": 7,
+      "t_mjd": 60987.1888,
+      "t_iso": "2025-11-08T04:31:52.320Z",
+      "detector": 5,
+      "wavelength_um": 4.2587,
+      "image_url": "assets/frames/07_D5_60987.1888.png"
+    },
+    {
+      "index": 8,
+      "t_mjd": 61022.3681,
+      "t_iso": "2025-12-13T08:50:03.840Z",
+      "detector": 5,
+      "wavelength_um": 4.2226,
+      "image_url": "assets/frames/08_D5_61022.3681.png"
+    },
+    {
+      "index": 9,
+      "t_mjd": 61162.6737,
+      "t_iso": "2026-05-02T16:10:07.680Z",
+      "detector": 5,
+      "wavelength_um": 4.2234,
+      "image_url": "assets/frames/09_D5_61162.6737.png"
+    },
+    {
+      "index": 10,
+      "t_mjd": 61162.6751,
+      "t_iso": "2026-05-02T16:12:08.640Z",
+      "detector": 5,
+      "wavelength_um": 4.2598,
+      "image_url": "assets/frames/10_D5_61162.6751.png"
+    },
+    {
+      "index": 11,
+      "t_mjd": 61163.2172,
+      "t_iso": "2026-05-03T05:12:46.080Z",
+      "detector": 5,
+      "wavelength_um": 4.2174,
+      "image_url": "assets/frames/11_D5_61163.2172.png"
+    },
+    {
+      "index": 12,
+      "t_mjd": 61171.5672,
+      "t_iso": "2026-05-11T13:36:46.079Z",
+      "detector": 5,
+      "wavelength_um": 4.2234,
+      "image_url": "assets/frames/12_D5_61171.5672.png"
+    },
+    {
+      "index": 13,
+      "t_mjd": 61172.1753,
+      "t_iso": "2026-05-12T04:12:25.920Z",
+      "detector": 5,
+      "wavelength_um": 4.2597,
+      "image_url": "assets/frames/13_D5_61172.1753.png"
+    },
+    {
+      "index": 14,
+      "t_mjd": 61173.0641,
+      "t_iso": "2026-05-13T01:32:18.240Z",
+      "detector": 5,
+      "wavelength_um": 4.2963,
+      "image_url": "assets/frames/14_D5_61173.0641.png"
+    },
+    {
+      "index": 15,
+      "t_mjd": 61173.6762,
+      "t_iso": "2026-05-13T16:13:43.680Z",
+      "detector": 5,
+      "wavelength_um": 4.3332,
+      "image_url": "assets/frames/15_D5_61173.6762.png"
+    },
+    {
+      "index": 16,
+      "t_mjd": 61174.2872,
+      "t_iso": "2026-05-14T06:53:34.080Z",
+      "detector": 5,
+      "wavelength_um": 4.3701,
+      "image_url": "assets/frames/16_D5_61174.2872.png"
+    }
+  ],
+  "meta": {
+    "mode": "all",
+    "warnings": [
+      "Sample timestamps are parsed from filenames; wavelengths are recorded in the upstream offline test. Epochs, alignment, calibration and quality flags are unverified."
+    ]
+  },
+  "provenance": {
+    "repository": "https://github.com/EbenDoesCoding/SPHERE-x",
+    "images": "src/backend/static/frames/test",
+    "wavelengths": "src/backend/test-spherex-offline.py",
+    "use": "Viewer testing only"
+  }
+}
