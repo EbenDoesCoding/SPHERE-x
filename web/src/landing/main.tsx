@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "../design/tokens.css";
+import "./landing.css";
 import { Landing } from "./Landing";
 
 const root = document.getElementById("root");
