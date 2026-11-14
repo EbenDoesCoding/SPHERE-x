@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from gaia import get_stars
 from resolve import resolve
 import cache
+from cleanup import trim_live_frames
 
 app = FastAPI(title="SPHERE-X API")
 
@@ -117,6 +118,8 @@ def _get_frames(ra: float, dec: float, size: float, detector=None, mode="best", 
             mode=mode, group_id=group_id,
         )
         json_path.write_text(json.dumps(result))
+		json_path.write_text(json.dumps(result))
+        trim_live_frames()
         return result
     finally:
         live_build_slots.release()
