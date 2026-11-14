@@ -7,6 +7,7 @@ exist only to exercise the arithmetic and the bookkeeping. The real pipeline out
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import math
@@ -16,7 +17,8 @@ import time
 import numpy as np
 import pytest
 
-from tombaugh import build, http, presets, remote_fits, stack
+from tombaugh import build, http, legacy, main, presets, remote_fits, stack
+from tombaugh import spectrum as spectra
 from tombaugh.build import (
     AlreadyBuilt,
     BuildStats,
@@ -363,18 +365,47 @@ def test_manifest_without_planes_is_empty():
 
 # ------------------------------------------------------------------------------------------- warnings
 def test_warning_texts():
+    """Visits are named by their dates, never by an id from 0; a blank (saturated) core and an overflowing
+    but measured one (indicative only) are told apart, in words the page can show."""
     stats = BuildStats(selected=258, read=250, failed=3, timed_out=5, unusable=1)
     grid, synthetic_planes, synthetic_items = _synthetic_field()
     manifest, _ = assemble_manifest(RA, DEC, 3, grid, synthetic_planes, synthetic_items, found=258)
-    assert build._warnings(stats, 12, 120.0, manifest.time_bins) == [
+    cores = {build.CORE_BLANK: 12, build.CORE_OVERFLOW: 7}
+    assert build._warnings(stats, cores, 120.0, manifest.time_bins) == [
         "build stopped at the 120 s deadline: 250 of 258 exposures were read",
         "3 exposures failed to download",
         "1 exposure could not be used (no valid pixel or unknown noise)",
-        "saturated core within 15 arcsec of the centre in 12 of 250 exposures",
-        "time bin 0 has only 3 exposures",
-        "time bin 1 has only 2 exposures",
+        (
+            "saturated core within 15 arcsec of the centre in 12 of 250 exposures: those pixels have no "
+            "value, so no brightness can be read there"
+        ),
+        (
+            "bright core within 15 arcsec of the centre flagged as overflowing in 7 of 250 exposures, but "
+            "measured: brightness there is indicative only"
+        ),
+        "the visit of 2025-05-05 to 2025-05-07 has only 3 exposures",
+        "the visit of 2025-08-13 to 2025-08-15 has only 2 exposures",
     ]
-    assert build._warnings(BuildStats(selected=30, read=30), 0, 120.0, []) == []
+    assert not any(
+        "time bin" in warning for warning in build._warnings(stats, cores, 120.0, manifest.time_bins)
+    )
+    overflow_only = build._warnings(BuildStats(read=30), {build.CORE_OVERFLOW: 2}, 120.0, [])
+    assert overflow_only == [
+        (
+            "bright core within 15 arcsec of the centre flagged as overflowing in 2 of 30 exposures, but "
+            "measured: brightness there is indicative only"
+        )
+    ]
+    assert not any("saturated" in warning for warning in overflow_only)
+    assert build._warnings(BuildStats(selected=30, read=30), {}, 120.0, []) == []
+
+
+def test_a_visit_of_one_day_is_named_by_that_day():
+    grid, synthetic_planes, synthetic_items = _synthetic_field()
+    manifest, _ = assemble_manifest(RA, DEC, 3, grid, synthetic_planes, synthetic_items, found=5)
+    one_day = manifest.time_bins[0].model_copy(update={"date_end": manifest.time_bins[0].date_start})
+    assert build.visit_label(one_day) == "the visit of 2025-05-05"
+    assert build.visit_label(manifest.time_bins[1]) == "the visit of 2025-08-13 to 2025-08-15"
 
 
 def test_notes_say_what_the_helium_line_cost():
@@ -392,31 +423,50 @@ def test_notes_say_what_the_helium_line_cost():
     ]
 
 
-def test_saturated_near_centre_looks_only_within_fifteen_arcsec():
+def test_core_near_centre_looks_only_within_fifteen_arcsec_and_tells_blank_from_overflow():
+    """A blank core (no value) is "saturated"; OVERFLOW on pixels that have values is "indicative only"
+    (regression: the warning fired as "saturated" on the OVERFLOW flag alone, also where no pixel was
+    blank, as for RW Aur)."""
     half = 20
     synthetic_image = np.ones((2 * half + 1, 2 * half + 1), dtype=np.float32)
     synthetic_flags = np.zeros(synthetic_image.shape, dtype=np.int32)
 
-    def cut(flags):
+    def cut(flags, image=synthetic_image):
         return Cutout(
-            exposure=synthetic_exposure("A_0001", 5, 60800.0), image=synthetic_image, flags=flags, x0=0, y0=0,
+            exposure=synthetic_exposure("A_0001", 5, 60800.0), image=image, flags=flags, x0=0, y0=0,
             wcs_header="", lam=4.0, dlam=0.04, mjd=60800.0, psf_fwhm=8.0,
         )  # fmt: skip
 
-    assert build._saturated_near_centre(cut(None)) is False
-    assert build._saturated_near_centre(cut(synthetic_flags)) is False
+    assert build._core_near_centre(cut(None)) is None
+    assert build._core_near_centre(cut(synthetic_flags)) is None
     radius_px = 15.0 / NATIVE_PIXSCALE_ARCSEC  # 2.44 native pixels
-    for offset, expected in [
+    for offset, near in [
         ((0, 0), True),
         ((2, 1), True),
         ((0, 2), True),
         ((2, 2), False),
         ((0, 3), False),
     ]:
+        assert (math.hypot(*offset) <= radius_px) is near
+        row, col = half + offset[0], half + offset[1]
         flags = synthetic_flags.copy()
-        flags[half + offset[0], half + offset[1]] = bit_mask(OVERFLOW)
-        assert (math.hypot(*offset) <= radius_px) is expected
-        assert build._saturated_near_centre(cut(flags)) is expected
+        flags[row, col] = bit_mask(OVERFLOW)
+        # OVERFLOW on a pixel that has a value: measured, indicative only
+        assert build._core_near_centre(cut(flags)) == (build.CORE_OVERFLOW if near else None)
+        # the same core with its pixel blank: saturated
+        synthetic_blank = synthetic_image.copy()
+        synthetic_blank[row, col] = np.nan
+        assert build._core_near_centre(cut(flags, synthetic_blank)) == (build.CORE_BLANK if near else None)
+    # a blank core outside the radius and an overflowing pixel inside it: indicative only, not saturated
+    flags = synthetic_flags.copy()
+    flags[half, half + 3] = flags[half, half] = bit_mask(OVERFLOW)
+    synthetic_blank = synthetic_image.copy()
+    synthetic_blank[half, half + 3] = np.nan
+    assert build._core_near_centre(cut(flags, synthetic_blank)) == build.CORE_OVERFLOW
+    # a pixel without a value and without any flag is not a saturated core (off the detector, for example)
+    synthetic_hole = synthetic_image.copy()
+    synthetic_hole[half, half] = np.nan
+    assert build._core_near_centre(cut(synthetic_flags, synthetic_hole)) is None
 
 
 # ---------------------------------------------------------------------------- the stages, no network
@@ -819,3 +869,210 @@ def test_build_refuses_a_position_out_of_range():
         build_field(10.0, 91.0, 6)
     with pytest.raises(ValueError):
         build_field(math.nan, 0.0, 6)
+
+
+# ------------------------------------------------------------------- older-survey (legacy) planes, no network
+def synthetic_legacy_plane(grid: Grid, band: str, gain: float | None, level: float) -> legacy.LegacyPlane:
+    """A legacy plane as tombaugh.legacy returns one, with synthetic pixels (the real ones need IRSA)."""
+    synthetic_data = np.full(grid.shape, level, dtype=np.float32)
+    synthetic_data[0, :] = np.nan  # a strip the survey does not cover
+    mission = legacy.mission_of(band)
+    label = f"{mission} {band}"
+    warnings = [] if gain is not None else [
+        f"{label}: not scaled on field stars (3 usable field stars in common, 5 needed); values in DN."
+    ]  # fmt: skip
+    return legacy.LegacyPlane(
+        mission=mission, band=band, data=synthetic_data, unit="DN" if gain is None else "MJy/sr (matched)",
+        native_unit="DN", gain=gain, n_stars=0 if gain is None else 7, sigma=0.02, lam_min=4.10, lam_max=5.16,
+        lam_eff=4.618, n_exposures=26, mjd_min=55319.5, mjd_max=55513.5, coverage=0.99,
+        images=["1342m076_ac51"], resolution_arcsec=6.4, notes=[f"{label}: a note"], warnings=warnings,
+    )  # fmt: skip
+
+
+class SyntheticOlderSurveys:
+    """Stands in for legacy.build_legacy_planes: records what it was given, returns `planes` and `warnings`."""
+
+    def __init__(self, planes=(), warnings=(), error: Exception | None = None, hang: bool = False):
+        self.planes, self.warnings, self.error, self.hang = list(planes), list(warnings), error, hang
+        self.calls: list[tuple] = []
+        self.references: dict[str, np.ndarray | None] = {}
+
+    def __call__(self, grid, bands, *, references=None, deadline=None):
+        self.calls.append((grid, tuple(bands)))
+        if self.hang:  # an archive that never answers: wait until the build gives up on us
+            while not deadline.expired:
+                time.sleep(0.01)
+        if self.error is not None:
+            raise self.error
+        for plane in self.planes:
+            self.references[plane.band] = references(plane.band)
+        result_warnings = self.warnings + [w for plane in self.planes for w in plane.warnings]
+        return legacy.LegacyResult(
+            planes=self.planes, warnings=result_warnings, seconds=0.5, bytes_downloaded=0, requests=0
+        )
+
+
+def test_build_appends_scaled_legacy_planes_after_the_spherex_planes(monkeypatch):
+    synthetic = synthetic_exposures({(0, 5): 8, (0, 6): 8, (1, 5): 9, (1, 6): 9})
+    _patch_archive(monkeypatch, synthetic)
+    grid = Grid.for_field(RA, DEC, 3)
+    older = SyntheticOlderSurveys(
+        [synthetic_legacy_plane(grid, "W2", 0.07, 0.25), synthetic_legacy_plane(grid, "Ks", None, 9.0)]
+    )
+    monkeypatch.setattr(build.legacy, "build_legacy_planes", older)
+    manifest, frames, stats = build_field_with_stats(RA, DEC, 3, legacy_bands=("W2", "Ks"))
+
+    assert older.calls == [(grid, ("W2", "Ks"))]
+    # the paired SPHEREx frame (presets.json legacy_pairs) was handed over once the stacks existed
+    assert older.references["W2"] is not None and older.references["W2"].shape == grid.shape
+    assert np.isfinite(older.references["W2"]).any()
+
+    sci = [p for p in manifest.planes if p.kind == "sci"]
+    assert len(sci) == 4 and [p.index for p in sci] == [0, 1, 2, 3]
+    [w2] = [p for p in manifest.planes if p.kind == "legacy"]  # Ks could not be scaled: left out
+    assert w2.model_dump() == {
+        "index": 4, "kind": "legacy", "mission": "AllWISE", "time_bin": None, "wave_bin": None, "band": "W2",
+        "lam_min": 4.1, "lam_max": 5.16, "lam_eff": 4.618, "n_exposures": 26, "sigma": 0.02,
+        "mjd_mid": 55416.5, "date_start": "2010-05-03", "date_end": "2010-11-13", "offset": 4 * 59 * 59 * 2,
+        "scaled": "field_stars",
+    }  # fmt: skip
+    assert manifest.frames.nbytes == len(frames) == 5 * 59 * 59 * 2
+    decoded = decode_planes(frames, 5, 59, 59)
+    assert np.isnan(decoded[4][0]).all() and np.allclose(decoded[4][1:], 0.25, atol=1e-3)
+    assert manifest.key == field_key(RA, DEC, 3, [e.uid for e in synthetic])  # legacy planes never enter it
+    assert "2MASS Ks: plane left out: its brightness could not be matched to SPHEREx on field stars." in (
+        manifest.warnings
+    )
+    assert not any("values in DN" in warning for warning in manifest.warnings)
+    assert "AllWISE W2: a note" in manifest.provenance.notes
+    assert "2MASS Ks: a note" not in manifest.provenance.notes
+    assert (stats.legacy_planes, stats.legacy_left_out, stats.legacy_incomplete) == (1, 1, False)
+    assert stats.seconds["legacy"] == 0.5
+    Manifest.model_validate(json.loads(manifest.model_dump_json()))
+    assert "exposures" not in stats.as_log() and len(stats.exposures) == 34
+
+
+def test_a_failing_legacy_step_never_fails_the_field(monkeypatch):
+    synthetic = synthetic_exposures({(0, 5): 8, (0, 6): 8})
+    _patch_archive(monkeypatch, synthetic)
+    monkeypatch.setattr(build.legacy, "build_legacy_planes", SyntheticOlderSurveys(error=RuntimeError("bug")))
+    manifest, frames, stats = build_field_with_stats(RA, DEC, 3, legacy_bands=legacy.LEGACY_BANDS)
+    assert manifest.status == "ready" and all(p.kind == "sci" for p in manifest.planes)
+    assert len(frames) == len(manifest.planes) * 59 * 59 * 2
+    assert "older-survey planes (AllWISE, 2MASS) could not be made (RuntimeError)" in manifest.warnings
+    assert stats.legacy_incomplete and stats.legacy_planes == 0
+
+
+@pytest.mark.parametrize(
+    ("warning", "incomplete"),
+    [
+        ("AllWISE: archive unavailable (UpstreamError: gave up after 6 attempts: HTTP 502); no AllWISE plane.", True),
+        ("2MASS Ks: 1 image(s) not read (ki0940209: UpstreamError: HTTP 503).", True),
+        ("2MASS Ks: no image of the archive covers this field.", False),
+        ("AllWISE W1: 12% of the field has no data from the survey.", False),
+    ],
+)  # fmt: skip
+def test_only_an_upstream_failure_of_the_older_surveys_asks_for_an_early_rebuild(
+    monkeypatch, warning, incomplete
+):
+    synthetic = synthetic_exposures({(0, 5): 8, (0, 6): 8})
+    _patch_archive(monkeypatch, synthetic)
+    monkeypatch.setattr(build.legacy, "build_legacy_planes", SyntheticOlderSurveys(warnings=[warning]))
+    manifest, _, stats = build_field_with_stats(RA, DEC, 3, legacy_bands=("W1", "Ks"))
+    assert warning in manifest.warnings and stats.legacy_incomplete is incomplete
+
+
+def test_older_surveys_are_not_waited_for_past_the_build_deadline(monkeypatch):
+    synthetic = synthetic_exposures({(0, 5): 8, (0, 6): 8})
+    _patch_archive(monkeypatch, synthetic)
+    older = SyntheticOlderSurveys(hang=True)
+    monkeypatch.setattr(build.legacy, "build_legacy_planes", older)
+    started = time.monotonic()
+    manifest, _, stats = build_field_with_stats(RA, DEC, 3, deadline_s=6.0, legacy_bands=("W2",))
+    assert time.monotonic() - started < 4.0
+    assert manifest.status == "ready" and stats.legacy_incomplete
+    assert (
+        "older-survey planes (AllWISE, 2MASS) were not ready before the build's deadline" in manifest.warnings
+    )
+
+
+def test_legacy_bands_are_checked_before_anything_is_sent(monkeypatch):
+    calls = _patch_archive(monkeypatch, synthetic_exposures({(0, 5): 8}))
+    with pytest.raises(KeyError):
+        build_field_with_stats(RA, DEC, 3, legacy_bands=("W3",))
+    assert calls["discover"] == []
+
+
+def test_an_uncovered_field_asks_no_older_survey(monkeypatch):
+    _patch_archive(monkeypatch, [])
+    older = SyntheticOlderSurveys()
+    monkeypatch.setattr(build.legacy, "build_legacy_planes", older)
+    manifest, frames, _ = build_field_with_stats(10.0, 20.0, 6, legacy_bands=legacy.LEGACY_BANDS)
+    assert manifest.status == "empty" and frames == b"" and older.calls == []
+
+
+def test_a_legacy_plane_that_cannot_be_described_is_left_out():
+    grid = Grid.for_field(RA, DEC, 3)
+    synthetic_broken = synthetic_legacy_plane(grid, "W1", 0.05, 0.3)
+    synthetic_broken.sigma = float("nan")
+    result = legacy.LegacyResult([synthetic_broken], [], 0.1, 0, 0)
+    outcome = build.keep_legacy_planes(result, grid)
+    assert outcome.planes == [] and outcome.left_out == 1
+    assert outcome.warnings == ["AllWISE W1: plane left out: its description is not valid (ValidationError)."]
+
+
+def test_the_service_build_asks_for_every_legacy_band(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(build, "build_field_with_stats", lambda *a, **k: seen.update(k) or "built")
+    assert build.build_field_for_service(RA, DEC, 3, deadline_s=10.0) == "built"
+    assert seen == {"legacy_bands": legacy.LEGACY_BANDS, "deadline_s": 10.0}
+    assert legacy.LEGACY_BANDS == ("W1", "W2", "J", "H", "Ks")
+
+
+def test_the_builder_keeps_the_exposure_list_and_rebuilds_soon_after_an_older_survey_failure(
+    monkeypatch, tmp_path
+):
+    synthetic = synthetic_exposures({(0, 5): 8, (0, 6): 8})
+    _patch_archive(monkeypatch, synthetic)
+    monkeypatch.setattr(
+        build.legacy,
+        "build_legacy_planes",
+        SyntheticOlderSurveys(
+            warnings=["AllWISE: archive unavailable (UpstreamError: x); no AllWISE plane."]
+        ),
+    )
+    now = [1_000_000.0]
+    cache = FieldCache(tmp_path / "cache", max_mb=50, clock=lambda: now[0])
+    builder = Builder(lambda: cache, build.build_field_for_service)
+    _run_to_the_end(builder, request_id(RA, DEC, 3))
+    key = cache.lookup(RA, DEC, 3)
+    assert key is not None
+    stored = spectra.exposures_from_json(gzip.decompress(cache.get_derived(key, main.EXPOSURES_NAME)))
+    assert [e.uid for e in stored] == [
+        e.uid for e in sorted(synthetic, key=lambda e: (e.mjd, e.det, e.obs_id))
+    ]
+    entry = cache._requests[request_id(RA, DEC, 3)]
+    assert "listing" not in entry  # incomplete: the next request after 10 minutes builds again
+    assert now[0] - entry["at"] == pytest.approx(REQUEST_TTL_S - main.RETRY_INCOMPLETE_S)
+
+
+def test_legacy_planes_are_scaled_even_when_the_spherex_reads_outlast_their_request_deadline(monkeypatch):
+    """Regression (live, RW Aur field, 14 Nov 2026): the SPHEREx reads took 55 s, longer than the older
+    surveys' 60 s request deadline, so their wait for the paired frames timed out and all five planes were
+    left out as unscaled. The wait is now bounded by the build's deadline."""
+    synthetic = synthetic_exposures({(0, 5): 8, (0, 6): 8})
+    _patch_archive(monkeypatch, synthetic)
+    reader = build.remote_fits.read_windows
+
+    def slow_read_windows(*args, **kwargs):
+        time.sleep(1.0)  # longer than the request deadline below
+        return reader(*args, **kwargs)
+
+    monkeypatch.setattr(build.remote_fits, "read_windows", slow_read_windows)
+    monkeypatch.setattr(build, "LEGACY_DEADLINE_S", 0.3)
+    grid = Grid.for_field(RA, DEC, 3)
+    older = SyntheticOlderSurveys([synthetic_legacy_plane(grid, "W2", 0.07, 0.25)])
+    monkeypatch.setattr(build.legacy, "build_legacy_planes", older)
+    manifest, _, stats = build_field_with_stats(RA, DEC, 3, legacy_bands=("W2",))
+    assert older.references["W2"] is not None
+    assert stats.legacy_planes == 1 and [p.band for p in manifest.planes if p.kind == "legacy"] == ["W2"]

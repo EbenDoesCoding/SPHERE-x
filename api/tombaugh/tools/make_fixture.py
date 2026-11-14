@@ -3,10 +3,12 @@
     cd api && uv run python -m tombaugh.tools.make_fixture wise0855
     cd api && uv run python -m tombaugh.tools.make_fixture barnard
 
-Builds the field through the production pipeline (`tombaugh.build.build_field`, live archive) and writes
+Builds the field through the production pipeline (`tombaugh.build.build_field`, live archive, with the
+older-survey planes of every band of `tombaugh.legacy.LEGACY_BANDS`, as the service builds) and writes
 ``cache/fixtures/<name>/manifest.json`` and ``frames.bin`` (uncompressed: the manifest's sha256 is over these
-bytes). Nothing is hand-made. The manifest gains ``fixture_stars``: three Gaia DR3 stars for decoder and grid
-tests, chosen from the catalogue alone, never by looking at the pixels:
+bytes); ``--out`` writes elsewhere. Nothing is hand-made, and nothing is written when the build or the
+older surveys did not answer completely. The manifest gains ``fixture_stars``: three Gaia DR3 stars for
+decoder and grid tests, chosen from the catalogue alone, never by looking at the pixels:
 
 * inside the field, at least 10 output pixels from its edge;
 * G magnitude from 12 to 15.5, and no source brighter than G = 10 within 60 arcsec;
@@ -46,6 +48,7 @@ from tombaugh import http
 from tombaugh.build import EPOCH_REF, BuildStats, build_field_with_stats
 from tombaugh.cache import compress_frames, write_atomic
 from tombaugh.grid import PIXSCALE_ARCSEC, Grid, sky_to_pixel, snap
+from tombaugh.legacy import LEGACY_BANDS
 from tombaugh.models import FixtureStar, Manifest
 
 FOV_ARCMIN = 6
@@ -297,11 +300,14 @@ def record(name: str, out_dir: Path, deadline_s: float = DEADLINE_S) -> tuple[Ma
         raise RuntimeError(
             f"only {len(stars)} of {len(catalogue)} Gaia sources qualify as fixture stars: nothing was written"
         )
-    manifest, frames, stats = build_field_with_stats(ra, dec, FOV_ARCMIN, deadline_s=deadline_s)
-    if manifest.status != "ready" or stats.failed or stats.timed_out:
+    manifest, frames, stats = build_field_with_stats(
+        ra, dec, FOV_ARCMIN, deadline_s=deadline_s, legacy_bands=LEGACY_BANDS
+    )
+    if manifest.status != "ready" or stats.failed or stats.timed_out or stats.legacy_incomplete:
         raise RuntimeError(
             f"the build is not complete (status {manifest.status}, {stats.failed} failed downloads, "
-            f"{stats.timed_out} not read in time): nothing was written"
+            f"{stats.timed_out} not read in time, older surveys incomplete: {stats.legacy_incomplete}): "
+            "nothing was written"
         )
     manifest.fixture_stars = fixture_star_models(stars, grid)
     folder = out_dir / name
@@ -320,7 +326,13 @@ def _summary(name: str, manifest: Manifest, frames: bytes, stats: BuildStats) ->
         "seconds": {stage: round(value, 2) for stage, value in stats.seconds.items()},
         "http": stats.http,
         "planes": len(manifest.planes),
+        "legacy_planes": [
+            {"index": p.index, "mission": p.mission, "band": p.band, "dates": f"{p.date_start}..{p.date_end}"}
+            for p in manifest.planes
+            if p.kind == "legacy"
+        ],
         "frames_bytes": len(frames),
+        "frames_sha256": manifest.frames.sha256 if manifest.frames else None,
         "frames_gzip_bytes": len(compress_frames(frames)),
         "time_bins": [
             {

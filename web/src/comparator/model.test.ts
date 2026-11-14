@@ -15,6 +15,7 @@ import { type Derived, deriveView, type Env } from "./derive";
 import { withFeatures } from "./features";
 import {
   type Action,
+  BAND_IDS,
   bandRange,
   CENTRE,
   caveatSentences,
@@ -63,6 +64,29 @@ function loadRecorded(name: RecordedId): LoadedField | null {
 const wise = loadRecorded("wise0855");
 const barnard = loadRecorded("barnard");
 const haveFixtures = wise !== null && barnard !== null;
+
+/**
+ * The recorded field minus its older-survey planes (and the provenance notes about them): the same
+ * real SPHEREx pixels, fewer planes. It stands for a field with no older-survey image, as a live
+ * build gives when the archives failed, or an engine older than pipeline 0.3.0.
+ */
+function withoutOlderSurveys(field: LoadedField): LoadedField {
+  const older = field.manifest.planes.filter((plane) => plane.kind === "legacy");
+  const missions = [...new Set(older.map((plane) => plane.mission))];
+  const planes = field.manifest.planes.filter((plane) => plane.kind !== "legacy");
+  const npix = field.synth.npix;
+  const values = new Float32Array(Math.max(...planes.map((plane) => plane.offset / 2 + npix)));
+  for (const plane of planes) values.set(field.synth.planeData(plane), plane.offset / 2);
+  const notes = field.manifest.provenance.notes.filter(
+    (note) => !missions.some((mission) => note.startsWith(`${mission} `)),
+  );
+  const manifest: Manifest = {
+    ...field.manifest,
+    planes,
+    provenance: { ...field.manifest.provenance, notes },
+  };
+  return { ...field, manifest, synth: new FieldSynth(manifest, values) };
+}
 
 /** Applies actions in order. */
 function run(state: ViewState, ...actions: Action[]): ViewState {
@@ -265,8 +289,12 @@ describe.skipIf(!haveFixtures)("the reducer", () => {
     expect(without(state, { type: "setView", view: "then" })).toBe(state);
     expect(without(state, { type: "setBand", band: "rgb" })).toBe(state);
     const built = createReducer(withFeatures({ thenAndNow: true, threeColour: true }));
-    // Built, but this field has no older survey image: Then and now stays greyed.
-    expect(built(state, { type: "setView", view: "then" })).toBe(state);
+    // Built, and the recorded field holds older-survey images (pipeline 0.3.0): it opens.
+    expect(built(state, { type: "setView", view: "then" }).view).toBe("then");
+    // Built, but a field with no older-survey image: Then and now stays greyed.
+    const bare = opened(withoutOlderSurveys(field()));
+    expect(built(bare, { type: "setView", view: "then" })).toBe(bare);
+    expect(effectiveView({ ...bare, view: "then" })).toBe("blink");
     expect(built(state, { type: "setBand", band: "rgb" }).band).toBe("rgb");
     const noSide = createReducer(withFeatures({ sideBySide: false }));
     expect(noSide(state, { type: "setView", view: "side" }).view).toBe("blink");
@@ -577,18 +605,21 @@ describe.skipIf(!haveFixtures)("what the design shows, from the real fields", ()
       "4 exposures could not be used.",
       "2 of 4 visits are partial, marked in Frames.",
     ]);
+    // Barnard's Star as pipeline 0.3.0 recorded it: the saturated core in Handoff-copy's form, the
+    // core that overflowed but was measured keeping its "indicative only", visits by their dates.
     const barnardCaveats = caveatSentences(
       (barnard as LoadedField).manifest,
       sequenceOf((barnard as LoadedField).synth, "all"),
     );
     expect(barnardCaveats).toEqual([
       "2 exposures could not be used.",
-      "Saturated core within 15″ of the centre in 359 of 360 exposures.",
+      "Saturated core within 15″ of the centre in 240 of 360 exposures.",
+      "Bright core within 15″ of the centre overflowed in 119 of 360 exposures: brightness there is indicative only.",
       "The visit of 30 Sep–1 Oct 2025 has only 9 exposures.",
       "The visit of 4–5 May 2026 has only 8 exposures.",
       "2 of 5 visits are partial, marked in Frames.",
     ]);
-    expect(barnardCaveats.join(" ")).not.toMatch(/time bin/i);
+    expect(barnardCaveats.join(" ")).not.toMatch(/time bin|\d{4}-\d{2}-\d{2}|arcsec/i);
   });
 
   it("leaves a warning about an unknown time bin as it is", () => {
@@ -605,7 +636,7 @@ describe.skipIf(!haveFixtures)("what the design shows, from the real fields", ()
         [],
       ),
     ).toBe("Saturated core within 15″ of the centre in 3 of 461 exposures.");
-    // Pipeline 0.2.0 (the recorded fields) already writes it so.
+    // Pipeline 0.2.0 wrote it so (the recorded fields until they were recorded again with 0.3.0).
     expect(
       rewriteWarning("saturated core within 15 arcsec of the centre in 359 of 360 exposures", []),
     ).toBe("Saturated core within 15″ of the centre in 359 of 360 exposures.");
@@ -632,18 +663,16 @@ describe.skipIf(!haveFixtures)("what the design shows, from the real fields", ()
     expect(rewriteWarning("the visit of 2025-13-40 has only 8 exposures", [])).toBe(
       "The visit of 2025-13-40 has only 8 exposures.",
     );
-    // The warnings of the Barnard's Star field as engine 0.3.0 records it (cache/fixtures in the
-    // engine branch, 14 Nov 2026), and the caveats the reader gets.
-    const manifest: Manifest = {
-      ...(barnard as LoadedField).manifest,
-      warnings: [
-        "2 exposures could not be used (no valid pixel or unknown noise)",
-        "saturated core within 15 arcsec of the centre in 240 of 360 exposures: those pixels have no value, so no brightness can be read there",
-        "bright core within 15 arcsec of the centre flagged as overflowing in 119 of 360 exposures, but measured: brightness there is indicative only",
-        "the visit of 2025-09-30 to 2025-10-01 has only 9 exposures",
-        "the visit of 2026-05-04 to 2026-05-05 has only 8 exposures",
-      ],
-    };
+    // The warnings of the Barnard's Star field as engine 0.3.0 recorded it (the bundled copy,
+    // 14 Nov 2026), and the caveats the reader gets.
+    const manifest = (barnard as LoadedField).manifest;
+    expect(manifest.warnings).toEqual([
+      "2 exposures could not be used (no valid pixel or unknown noise)",
+      "saturated core within 15 arcsec of the centre in 240 of 360 exposures: those pixels have no value, so no brightness can be read there",
+      "bright core within 15 arcsec of the centre flagged as overflowing in 119 of 360 exposures, but measured: brightness there is indicative only",
+      "the visit of 2025-09-30 to 2025-10-01 has only 9 exposures",
+      "the visit of 2026-05-04 to 2026-05-05 has only 8 exposures",
+    ]);
     expect(caveatSentences(manifest, null)).toEqual([
       "2 exposures could not be used.",
       "Saturated core within 15″ of the centre in 240 of 360 exposures.",
@@ -681,7 +710,8 @@ describe.skipIf(!haveFixtures)("what the design shows, from the real fields", ()
     expect(p.used).toBe("254 of 258");
     expect(p.release).toBe("SPHEREx Spectral Images, DR1");
     expect(p.dois.map((d) => d.doi)).toEqual(["10.26131/IRSA678"]);
-    expect(p.pipeline).toBe("0.2.0");
+    // Both recorded fields were recorded again with pipeline 0.3.0 (older-survey planes added).
+    expect(p.pipeline).toBe("0.3.0");
     // The design's viewer measured the same scale on the same data.
     expect(p.stretch).toBe("−0.0180 to 0.440 MJy/sr");
     expect(p.warnings).toEqual(["None"]);
@@ -689,6 +719,7 @@ describe.skipIf(!haveFixtures)("what the design shows, from the real fields", ()
     expect(b.used).toBe("348 of 364");
     expect(b.release).toBe("SPHEREx Spectral Images, DR1 and QR3");
     expect(b.dois.map((d) => d.release)).toEqual(["DR1", "QR3"]);
+    expect(b.pipeline).toBe("0.3.0");
     expect(b.stretch).toBeNull();
   });
 
@@ -834,14 +865,22 @@ describe.skipIf(!haveFixtures)("deriveView", () => {
   });
 
   it("writes each greyed view's reason in one line of the view rail", () => {
-    const sequence = sequenceOf((wise as LoadedField).synth, "cold");
-    const note = viewBlocked("then", sequence, (wise as LoadedField).manifest);
+    // A field with no older-survey image greys Then and now.
+    const bare = withoutOlderSurveys(wise as LoadedField);
+    const sequence = sequenceOf(bare.synth, "cold");
+    const note = viewBlocked("then", sequence, bare.manifest);
     expect(note).toBe("Then and now is greyed: no older survey image here.");
     // 362px of text-caption hold about 55 characters.
     expect(note?.length ?? 0).toBeLessThanOrEqual(52);
-    expect(
-      viewBlocked("side", sequence.slice(0, 1), (wise as LoadedField).manifest)?.length,
-    ).toBeLessThanOrEqual(52);
+    expect(viewBlocked("side", sequence.slice(0, 1), bare.manifest)?.length).toBeLessThanOrEqual(
+      52,
+    );
+    // The recorded fields hold older-survey images (pipeline 0.3.0): never greyed there.
+    for (const field of [wise, barnard] as LoadedField[]) {
+      for (const band of BAND_IDS) {
+        expect(viewBlocked("then", sequenceOf(field.synth, band), field.manifest)).toBeNull();
+      }
+    }
   });
 
   it("follows reduced motion", () => {

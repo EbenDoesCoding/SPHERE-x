@@ -300,8 +300,36 @@ describe.skipIf(!haveFixtures)("the extras on a recorded field", () => {
     expect(legendOf(gaiaDown)).toMatchObject({ gaia: false, catwise: true });
   });
 
-  // The recorded fields hold no older-survey image, so the model never opens Then and now on
-  // them: the view is set by hand here to check what the two squares would show.
+  it("Then and now on the recorded fields: the older image and the stack, each on its own scale", () => {
+    // Pipeline 0.3.0 recorded both fields with their older-survey images, so the model opens the
+    // view on them (Barnard's Star: All pairs WISE W1 with D4; WISE 0855: Cold objects with W2).
+    for (const recorded of [wise, barnard] as LoadedField[]) {
+      const vm = viewOf(
+        opened(recorded, { type: "setView", view: "then" }, { type: "setContrast", contrast: 6 }),
+      );
+      expect(vm.field?.view).toBe("then");
+      const then = vm.extras.thenAndNow;
+      if (!then.older || !then.sphx) throw new Error("Then and now is not ready");
+      const [a, b] = squaresOf(vm);
+      expect(a).toMatchObject({ id: "a", survey: true, markerFrame: null, note: null });
+      expect(a.aria).toBe(`Image from another survey: ${then.older.title}`);
+      expect(b).toMatchObject({ id: "b", survey: false, markerFrame: "stack", note: null });
+      if (a.picture?.kind !== "grey" || b.picture?.kind !== "grey")
+        throw new Error("grey expected");
+      expect(a.picture.data).toBe(then.older.data);
+      expect(a.picture.limits).toBe(withContrast(then.older.limits, 6));
+      expect(b.picture.data).toBe(then.sphx.data);
+      expect(b.picture.limits).toBe(withContrast(then.sphx.limits, 6));
+      expect(a.picture.limits).not.toEqual(b.picture.limits);
+      expect(a.picture.limits).not.toEqual(vm.field?.displayLimits);
+      expect(fitInUse(vm)).toBe(vm.geometry.two);
+      // Every pixel of these older images and stacks has a value: no hatch to key.
+      expect(legendOf(vm).noData).toBe(false);
+    }
+  });
+
+  // Then and now models made by hand, the view set by hand: what the two squares draw for any
+  // model the extras lane can give, the one without an older image included.
   function thenView(thenAndNow: ExtrasVM["thenAndNow"], contrast = 5): ViewModel {
     const vm = viewOf(opened(field(), { type: "setContrast", contrast }), { thenAndNow });
     if (!vm.field) throw new Error("field expected");

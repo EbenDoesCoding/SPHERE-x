@@ -1,7 +1,9 @@
 /* ==========================================================================
    The extras lane: the spectrum panel (blocks/SpectrumPanel.tsx). Tokens and bc- classes only.
-   The table scrolls inside the panel (Handoff-behaviour): 250 px at 1280 and 1440, 300 px on a
-   phone, as on the boards (Main.dc.html, Phone.dc.html).
+   The table scrolls inside the panel (Handoff-behaviour): 250 px at 1440, 300 px on a phone, as on
+   the boards (Main.dc.html, Phone.dc.html); 244 px at 1280, so that the 1280 x 720 rail holds the
+   panel with the engine's warning notice and a provenance of three lines (RW Aurigae, measured
+   with 250 px: 694 px in the 688 px rail).
    ========================================================================== */
 
 .cmp-sp-table {
@@ -9,13 +11,29 @@
   overflow-y: auto;
 }
 
-.cmp--three .cmp-sp-table,
+.cmp--three .cmp-sp-table {
+  max-height: calc(var(--space-1) * 61);
+}
+
 .cmp--wide .cmp-sp-table {
   max-height: calc(var(--space-1) * 62.5);
 }
 
-/* The chart keeps the size it was laid out for: the SVG is drawn at the measured width. */
+/* The chart is drawn at its own box, which SpectrumPanel measures: the panel's width and this
+   height. On a phone and in the rail layout, the board's 200 px (Phone.dc.html). The boards draw
+   190 px at 1280 and 136 px at 1440 (Main.dc.html); here 166 px and 132 px, so that the view rail
+   holds the panel with the engine's warning notice and a provenance of three lines (RW Aurigae,
+   measured with the boards' heights: 712 px in the 688 px rail at 1280 x 720, 872 in 868 at
+   1440 x 900). */
 .cmp-sp .bc-chart {
   max-width: 100%;
-  height: auto;
+  height: calc(var(--space-1) * 50);
+}
+
+.cmp--three .cmp-sp .bc-chart {
+  height: calc(var(--space-1) * 41.5);
+}
+
+.cmp--wide .cmp-sp .bc-chart {
+  height: calc(var(--space-1) * 33);
 }

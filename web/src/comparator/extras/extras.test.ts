@@ -16,17 +16,22 @@ import type {
 } from "../../contract";
 import { decodeFloat16 } from "../../player/float16";
 import { gridOf } from "../../player/grid";
-import { contractWaveBins, PRESETS_FILE } from "../../player/presets";
+import { contractWaveBins, LEGACY_PAIRS, PRESETS_FILE } from "../../player/presets";
+import { pooledLimits } from "../../player/render";
 import { FieldSynth } from "../../player/synth";
 import { type Derived, deriveView, type Env } from "../derive";
 import { withFeatures } from "../features";
 import {
   type Action,
+  BAND_IDS,
+  BANDS,
+  type BandId,
   frameLabels,
   INITIAL_STATE,
   type LoadedField,
   type RecordedId,
   reduce,
+  sequenceLimits,
   sequenceOf,
   type ViewState,
 } from "../model";
@@ -70,6 +75,33 @@ function loadRecorded(name: RecordedId): LoadedField | null {
 const wise = loadRecorded("wise0855");
 const barnard = loadRecorded("barnard");
 const haveFixtures = wise !== null && barnard !== null;
+
+/**
+ * The recorded field minus its older-survey planes (and the provenance notes about them): the same
+ * real SPHEREx pixels, fewer planes. It stands for a field with no older-survey image, as a live
+ * build gives when the archives failed, or an engine older than pipeline 0.3.0.
+ */
+function withoutOlderSurveys(field: LoadedField): LoadedField {
+  const older = field.manifest.planes.filter((plane) => plane.kind === "legacy");
+  const missions = [...new Set(older.map((plane) => plane.mission))];
+  const planes = field.manifest.planes.filter((plane) => plane.kind !== "legacy");
+  const npix = field.synth.npix;
+  const values = new Float32Array(Math.max(...planes.map((plane) => plane.offset / 2 + npix)));
+  for (const plane of planes) values.set(field.synth.planeData(plane), plane.offset / 2);
+  const notes = field.manifest.provenance.notes.filter(
+    (note) => !missions.some((mission) => note.startsWith(`${mission} `)),
+  );
+  const manifest: Manifest = {
+    ...field.manifest,
+    planes,
+    provenance: { ...field.manifest.provenance, notes },
+  };
+  return { ...field, manifest, synth: new FieldSynth(manifest, values) };
+}
+
+/** The bytes of an array of pixels: equal bytes are equal pixels, no-data (NaN) included. */
+const bytesOf = (data: Float32Array) => Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+const samePixels = (a: Float32Array, b: Float32Array) => bytesOf(a).equals(bytesOf(b));
 
 const run = (state: ViewState, ...actions: Action[]) => actions.reduce(reduce, state);
 
@@ -159,12 +191,219 @@ describe("three-colour", () => {
 
 describe("Then and now", () => {
   it.skipIf(!haveFixtures)("says so when a field has no older survey image", () => {
-    const then = thenAndNowOf((wise as LoadedField).synth, "cold");
+    const bare = withoutOlderSurveys(wise as LoadedField);
+    const then = thenAndNowOf(bare.synth, "cold");
     expect(then).toEqual({ status: "none", note: NO_OLDER_IMAGE, older: null, sphx: null });
-    const v = derive(opened(wise as LoadedField));
+    const v = derive(opened(bare));
     expect(v.views.find((o) => o.id === "then")?.disabled).toBe(true);
     expect(v.extras.thenAndNow.status).toBe("none");
+    // A link that names the view opens Blink on such a field.
+    expect(derive(run(opened(bare), { type: "setView", view: "then" })).field?.view).toBe("blink");
   });
+
+  // The older-survey planes of the recorded fields (pipeline 0.3.0), as their manifests state them.
+  const OLDER = {
+    wise0855: {
+      W1: ["2010-05-03", "2010-11-13", "WISE W1, 2010", "May to Nov 2010"],
+      W2: ["2010-05-03", "2010-11-13", "WISE W2, 2010", "May to Nov 2010"],
+      J: ["1998-12-28", "1998-12-28", "2MASS J, 1998", "Dec 1998"],
+      H: ["1998-12-28", "1998-12-28", "2MASS H, 1998", "Dec 1998"],
+      Ks: ["1998-12-28", "1998-12-28", "2MASS Ks, 1998", "Dec 1998"],
+    },
+    barnard: {
+      W1: ["2010-03-18", "2010-09-19", "WISE W1, 2010", "Mar to Sep 2010"],
+      W2: ["2010-03-18", "2010-09-19", "WISE W2, 2010", "Mar to Sep 2010"],
+      J: ["2000-05-28", "2000-05-28", "2MASS J, 2000", "May 2000"],
+      H: ["2000-05-28", "2000-05-28", "2MASS H, 2000", "May 2000"],
+      Ks: ["2000-05-28", "2000-05-28", "2MASS Ks, 2000", "May 2000"],
+    },
+  } as const;
+  type OlderBand = keyof (typeof OLDER)["wise0855"];
+
+  /**
+   * presets.json legacy_pairs: W1 with D4, W2 with Cold objects, J and H with D2 (J comes first),
+   * Ks with D3. A band with no older image of its own is shown the field's first, WISE W1, with D4.
+   */
+  const PAIRED: Record<BandId, { older: OlderBand; preset: BandId; own: boolean }> = {
+    d1: { older: "W1", preset: "d4", own: false },
+    d2: { older: "J", preset: "d2", own: true },
+    d3: { older: "Ks", preset: "d3", own: true },
+    d4: { older: "W1", preset: "d4", own: true },
+    d5: { older: "W1", preset: "d4", own: false },
+    d6: { older: "W1", preset: "d4", own: false },
+    all: { older: "W1", preset: "d4", own: false },
+    cold: { older: "W2", preset: "cold", own: true },
+    rgb: { older: "W1", preset: "d4", own: false },
+  };
+
+  /** The SPHEREx stacks the pairings show: range, exposures over every visit, months. */
+  const STACKS: Record<RecordedId, Partial<Record<BandId, [string, string, string]>>> = {
+    wise0855: {
+      d2: ["SPHEREx 1.10 to 1.65 µm", "47 exposures", "May 2025 to May 2026"],
+      d3: ["SPHEREx 1.64 to 2.42 µm", "45 exposures", "May 2025 to May 2026"],
+      d4: ["SPHEREx 2.42 to 3.82 µm", "36 exposures", "May 2025 to May 2026"],
+      cold: ["SPHEREx 3.96 to 5.00 µm", "84 exposures", "May 2025 to May 2026"],
+    },
+    barnard: {
+      d2: ["SPHEREx 1.10 to 1.65 µm", "59 exposures", "Aug 2025 to Sep 2026"],
+      d3: ["SPHEREx 1.64 to 2.42 µm", "59 exposures", "Aug 2025 to Aug 2026"],
+      d4: ["SPHEREx 2.42 to 3.82 µm", "59 exposures", "Aug 2025 to Sep 2026"],
+      cold: ["SPHEREx 3.96 to 5.00 µm", "103 exposures", "Aug 2025 to Sep 2026"],
+    },
+  };
+
+  it.skipIf(!haveFixtures)("holds five older-survey images on each recorded field", () => {
+    expect(LEGACY_PAIRS.map((pair) => [pair.band, pair.spherex_preset])).toEqual([
+      ["W1", "d4"],
+      ["W2", "cold"],
+      ["J", "d2"],
+      ["H", "d2"],
+      ["Ks", "d3"],
+    ]);
+    for (const field of [wise, barnard] as LoadedField[]) {
+      const older = field.synth.legacyPlanes();
+      const recorded = OLDER[field.recorded as RecordedId];
+      expect(older.map((plane) => [plane.mission, plane.band])).toEqual([
+        ["AllWISE", "W1"],
+        ["AllWISE", "W2"],
+        ["2MASS", "J"],
+        ["2MASS", "H"],
+        ["2MASS", "Ks"],
+      ]);
+      for (const plane of older) {
+        const [start, end] = recorded[plane.band as OlderBand];
+        expect([plane.date_start, plane.date_end, plane.scaled]).toEqual([
+          start,
+          end,
+          "field_stars",
+        ]);
+      }
+    }
+  });
+
+  it.skipIf(!haveFixtures)(
+    "is offered and ready on both recorded fields, from the engine and from the bundled copy",
+    () => {
+      for (const field of [wise, barnard] as LoadedField[]) {
+        for (const [source, engine] of [
+          ["api", "up"],
+          ["bundled", "down"],
+        ] as const) {
+          const state = opened({ ...field, source });
+          const before = derive(state, { engine });
+          expect(before.views.find((o) => o.id === "then")?.disabled).toBe(false);
+          const v = derive(run(state, { type: "setView", view: "then" }), { engine });
+          expect(v.field?.view).toBe("then");
+          expect(v.extras.thenAndNow.status).toBe("ready");
+          expect(v.frameLabel.kind).toBe("two");
+          expect(v.readout.value).toBe("");
+          const then = v.extras.thenAndNow;
+          expect(v.image.pairAria).toEqual({
+            a: `Image from another survey: ${then.older?.title}`,
+            b: `SPHEREx frame, ${then.sphx?.title.replace(/^SPHEREx /, "")}, ${then.sphx?.dates}`,
+          });
+        }
+      }
+    },
+  );
+
+  it.skipIf(!haveFixtures)(
+    "pairs each band with its older image as presets.json says, titled and dated from the manifest",
+    () => {
+      for (const field of [wise, barnard] as LoadedField[]) {
+        const id = field.recorded as RecordedId;
+        for (const band of BAND_IDS) {
+          const paired = PAIRED[band];
+          const [, , title, dates] = OLDER[id][paired.older];
+          const then = thenAndNowOf(field.synth, band);
+          expect(then.status).toBe("ready");
+          expect(then.older).toMatchObject({ title, dates });
+          expect([then.sphx?.title, then.sphx?.exposures, then.sphx?.dates]).toEqual(
+            STACKS[id][paired.preset],
+          );
+          expect(then.note).toBe(
+            paired.own
+              ? null
+              : `No older survey image matches ${BANDS[band].spoken}. Then and now pairs WISE W1 with D4.`,
+          );
+        }
+      }
+    },
+  );
+
+  it.skipIf(!haveFixtures)(
+    "shows the older image as recorded beside one SPHEREx stack of the paired band, each on its own scale",
+    () => {
+      for (const field of [wise, barnard] as LoadedField[]) {
+        for (const band of ["cold", "all", "d2", "d3"] as const) {
+          const { older: olderBand, preset } = PAIRED[band];
+          const plane = field.synth.legacyPlanes().find((p) => p.band === olderBand);
+          if (!plane) throw new Error(`no ${olderBand} plane`);
+          const then = thenAndNowOf(field.synth, band);
+          if (!then.older || !then.sphx) throw new Error("Then and now is not ready");
+          const olderData = field.synth.planeData(plane);
+          const stack = field.synth.stackFor(preset);
+          expect(samePixels(then.older.data, olderData)).toBe(true);
+          expect(then.older.limits).toEqual(
+            pooledLimits([{ data: olderData, sigma: plane.sigma }]),
+          );
+          expect(samePixels(then.sphx.data, stack.data)).toBe(true);
+          expect(then.sphx.limits).toEqual(pooledLimits([stack]));
+          // Never one scale for both, and never the blink sequence's scale.
+          expect(then.older.limits).not.toEqual(then.sphx.limits);
+          expect(then.older.limits).not.toEqual(sequenceLimits(sequenceOf(field.synth, band)));
+          // Every visit in the stack: its exposures are the band's over the whole sequence.
+          const exposures = sequenceOf(field.synth, preset).reduce(
+            (sum, f) => sum + f.frame.nExposures,
+            0,
+          );
+          expect(then.sphx.exposures).toBe(`${exposures} exposures`);
+        }
+      }
+    },
+  );
+
+  it.skipIf(!haveFixtures)(
+    "never lets an older image into a SPHEREx frame, stack, scale, three-colour frame or difference",
+    () => {
+      for (const field of [wise, barnard] as LoadedField[]) {
+        const bare = withoutOlderSurveys(field);
+        expect(bare.manifest.planes.length).toBe(field.manifest.planes.length - 5);
+        for (const band of BAND_IDS) {
+          const withOlder = sequenceOf(field.synth, band);
+          const without = sequenceOf(bare.synth, band);
+          expect(withOlder.map((f) => [f.frame.nExposures, f.frame.waveBins, f.partial])).toEqual(
+            without.map((f) => [f.frame.nExposures, f.frame.waveBins, f.partial]),
+          );
+          withOlder.forEach((f, i) => {
+            expect(samePixels(f.frame.data, without[i].frame.data)).toBe(true);
+            expect(f.frame.sigma).toBe(without[i].frame.sigma);
+          });
+          expect(sequenceLimits(withOlder)).toEqual(sequenceLimits(without));
+          if (band !== "rgb") {
+            expect(
+              samePixels(field.synth.stackFor(band).data, bare.synth.stackFor(band).data),
+            ).toBe(true);
+          }
+        }
+        const rgb = threeColourFrames(field.synth);
+        const rgbBare = threeColourFrames(bare.synth);
+        rgb.forEach((frame, i) => {
+          for (const pick of ["r", "g", "b"] as const) {
+            expect(samePixels(frame[pick].data, rgbBare[i][pick].data)).toBe(true);
+            expect(frame[pick].limits).toEqual(rgbBare[i][pick].limits);
+          }
+        });
+        const difference = (f: LoadedField) =>
+          derive(run(opened(f), { type: "setView", view: "difference" })).field?.difference;
+        const a = difference(field);
+        const b = difference(bare);
+        if (!a || !b) throw new Error("no difference");
+        expect(samePixels(a.data, b.data)).toBe(true);
+        expect(a.sigma).toBe(b.sigma);
+      }
+    },
+  );
 
   /** A 2 x 2 field: two visits in D6 and one AllWISE W2 plane. Arithmetic only. */
   function synthetic_then(band: string) {

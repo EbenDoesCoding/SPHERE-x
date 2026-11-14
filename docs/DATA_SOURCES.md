@@ -36,8 +36,8 @@ acknowledgement texts: those are still to be looked up (see the last section).
 |---|---|---|---|---|
 | Gaia DR3 | Star positions, proper motions and parallaxes: reference stars for the fixtures, catalogue overlay, positions carried to the observation date | Used in the first morning's measurements (ESA Gaia Archive). Planned in the API, through the Gaia services at ARI Heidelberg and the GAVO Data Center | Gaia Data Release 3, from the Gaia mission of the European Space Agency (ESA) | <https://www.cosmos.esa.int/gaia> |
 | CatWISE2020 | Catalogue overlay and positions of cold, faint sources | Planned | The CatWISE2020 catalogue, built from WISE and NEOWISE survey data and served by IRSA | <https://catwise.github.io/> |
-| AllWISE | Atlas images for the "Then & Now" comparison; catalogue magnitudes as a cross-check | Atlas images planned. Source Catalog used in a morning prototype (IRSA TAP) | Images and catalogue of the AllWISE programme, from NASA's Wide-field Infrared Survey Explorer (WISE), served by IRSA | <https://irsa.ipac.caltech.edu/Missions/wise.html> |
-| 2MASS | Atlas images for the "Then & Now" comparison; catalogue magnitudes as a cross-check | Atlas images planned. Point Source Catalog used in a morning prototype (IRSA TAP) | Images and catalogue of the Two Micron All Sky Survey (2MASS), served by IRSA | <https://irsa.ipac.caltech.edu/Missions/2mass.html> |
+| AllWISE | Atlas images for the "Then & Now" comparison; catalogue magnitudes as a cross-check | Atlas images planned. Source Catalog used in a morning prototype (IRSA TAP) | Images and catalogue of the AllWISE programme, from NASA's Wide-field Infrared Survey Explorer (WISE), served by IRSA | <https://irsa.ipac.caltech.edu/Missions/wise.html>; Atlas images: AllWISE Atlas (L3a) Coadd Images, [10.26131/IRSA153](https://doi.org/10.26131/IRSA153) |
+| 2MASS | Atlas images for the "Then & Now" comparison; catalogue magnitudes as a cross-check | Atlas images planned. Point Source Catalog used in a morning prototype (IRSA TAP) | Images and catalogue of the Two Micron All Sky Survey (2MASS), served by IRSA | <https://irsa.ipac.caltech.edu/Missions/2mass.html>; Atlas images: 2MASS All-Sky Atlas Image Service, [10.26131/IRSA121](https://doi.org/10.26131/IRSA121) |
 | SIMBAD | Names, coordinates and proper motions of known objects | Used in the first morning's measurements (mirror at CfA). Planned in the API for name lookup | The SIMBAD database of the Centre de Données astronomiques de Strasbourg (CDS), reached through its mirror at the Center for Astrophysics, Harvard & Smithsonian (CfA) | <https://simbad.harvard.edu/simbad/> |
 | Sesame | Turns an object name into a position | Planned, through the VizieR mirrors at CfA and at IDIA | The Sesame name resolver of CDS, reached through mirrors at CfA and at the Inter-University Institute for Data Intensive Astronomy (IDIA) | <https://vizier.cfa.harvard.edu/> and <https://vizier.idia.ac.za/> |
 | IMCCE SkyBoT | Known solar-system objects near a position at a given time | Planned | The Sky Body Tracker (SkyBoT) service of IMCCE, Observatoire de Paris | <https://ssp.imcce.fr/webservices/skybot/> |
@@ -58,7 +58,12 @@ Official acknowledgement or citation texts still to be looked up at the provider
 - [ ] WISE, AllWISE and NEOWISE: the acknowledgement for WISE data products.
 - [ ] CatWISE2020: the requested citation and acknowledgement.
 - [ ] 2MASS: the acknowledgement for 2MASS data products.
-- [ ] IRSA dataset DOIs for the AllWISE, 2MASS and CatWISE products actually used.
+- [ ] IRSA dataset DOIs for the AllWISE, 2MASS and CatWISE products actually used. Found on 14 November 2026
+  for the Atlas images that the Then & Now planes read: 10.26131/IRSA153, "AllWISE Atlas (L3a) Coadd Images"
+  (asked for on <https://irsa.ipac.caltech.edu/docs/program_interface/sia_allwise_atlas.html>), and
+  10.26131/IRSA121, "2MASS All-Sky Atlas Image Service" (asked for on
+  <https://irsa.ipac.caltech.edu/docs/program_interface/sia_2mass_allsky.html>); both names as their landing
+  pages at doi.org give them. Still open: CatWISE2020, and the AllWISE and 2MASS catalogues if they stay.
 - [ ] SIMBAD and Sesame (CDS): the acknowledgement for each service, and whether the mirrors ask for one.
 - [ ] ARI Heidelberg and GAVO: whether their Gaia services ask for an acknowledgement.
 - [ ] IMCCE SkyBoT: the requested citation.

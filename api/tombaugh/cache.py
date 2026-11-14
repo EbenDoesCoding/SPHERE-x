@@ -5,6 +5,8 @@ root, found relative to this package):
 
     fields/<key>/manifest.json     the manifest exactly as served
     fields/<key>/frames.bin.gz     frames.bin, gzip-compressed (served with Content-Encoding: gzip)
+    derived/<key>/<name>           answers derived from a field: its exposure list, catalogue overlays,
+                                   spectra (written by tombaugh.main; the key may also be a recorded field's)
     requests.json                  snapped request -> {"key", "at", "newest_mjd", "listing"}
     pinned.json                    a JSON list of keys that are never evicted
 
@@ -12,7 +14,9 @@ A key is 16 hexadecimal characters and names its content, so writing a key twice
 written to a temporary name in its own directory and renamed, so a reader never sees half a file.
 
 The cap (``TOMBAUGH_CACHE_MAX_MB``, default 2500) counts the bytes under ``fields``. When it is exceeded the
-least recently used keys are removed, never a pinned key and never the key just written.
+least recently used keys are removed, never a pinned key and never the key just written. Derived files have
+a cap of their own, a tenth of that one (at least 16 MB), and the least recently used files go first; the
+derived files of a field go with it when the field is evicted.
 
 Sizes are bytes unless a name says megabytes (2**20 bytes); times are Unix seconds.
 
@@ -46,6 +50,10 @@ GZIP_LEVEL = 6
 KEY_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 MANIFEST_NAME = "manifest.json"
 FRAMES_NAME = "frames.bin.gz"
+DERIVED_DIR = "derived"
+DERIVED_SHARE = 0.1  # derived files may use this share of the cap ...
+DERIVED_MIN_MB = 16.0  # ... and at least this many megabytes
+DERIVED_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")  # a file name, never a path
 _TMP_SUFFIX = ".tmp"
 
 
@@ -115,15 +123,19 @@ class FieldCache:
     ) -> None:
         self.root = Path(root) if root is not None else default_cache_dir()
         self.max_bytes = int((max_mb if max_mb is not None else default_max_mb()) * MB)
+        self.derived_max_bytes = max(int(DERIVED_MIN_MB * MB), int(DERIVED_SHARE * self.max_bytes))
         self._clock = clock
         self._lock = threading.RLock()
         self._entries: dict[str, _Entry] = {}
+        self._derived: dict[tuple[str, str], _Entry] = {}
         self._requests: dict[str, dict] = {}
         self._fields = self.root / "fields"
+        self._derived_root = self.root / DERIVED_DIR
         self._requests_path = self.root / "requests.json"
         self._pinned_path = self.root / "pinned.json"
         self._fields.mkdir(parents=True, exist_ok=True)
         self._scan()
+        self._scan_derived()
         self._load_requests()
 
     # ------------------------------------------------------------------ fields
@@ -254,6 +266,94 @@ class FieldCache:
         self._entries.pop(key, None)
         for name in [name for name, entry in self._requests.items() if entry.get("key") == key]:
             del self._requests[name]
+        self._remove_derived(key)
+
+    # ------------------------------------------------------------------ derived files
+    def _derived_path(self, key: str, name: str) -> Path:
+        if not is_key(key):
+            raise ValueError(f"not a cache key: {key!r}")
+        if not isinstance(name, str) or DERIVED_NAME.fullmatch(name) is None:
+            raise ValueError(f"not a derived file name: {name!r}")
+        return self._derived_root / key / name
+
+    def _scan_derived(self) -> None:
+        """Rebuild the table of derived files from the disk; drop temporary leftovers."""
+        if not self._derived_root.is_dir():
+            return
+        for folder in self._derived_root.iterdir():
+            if not folder.is_dir() or not is_key(folder.name):
+                continue
+            for path in folder.iterdir():
+                if path.name.endswith(_TMP_SUFFIX):
+                    path.unlink(missing_ok=True)
+                elif path.is_file() and DERIVED_NAME.fullmatch(path.name):
+                    stat = path.stat()
+                    self._derived[(folder.name, path.name)] = _Entry(
+                        stat.st_size, stat.st_mtime, stat.st_mtime
+                    )
+
+    def put_derived(self, key: str, name: str, data: bytes) -> list[tuple[str, str]]:
+        """Store a file derived from the field `key` (which need not be stored here: a recorded field's key
+        is allowed). Returns the (key, name) pairs evicted to stay under the derived cap."""
+        path = self._derived_path(key, name)
+        with self._lock:
+            write_atomic(path, data)
+            now = self._clock()
+            os.utime(path, (now, now))
+            self._derived[(key, name)] = _Entry(len(data), now, now)
+            return self._evict_derived(protect=(key, name))
+
+    def get_derived(self, key: str, name: str) -> bytes | None:
+        """A derived file of the field `key`, or None."""
+        try:
+            path = self._derived_path(key, name)
+        except ValueError:
+            return None
+        with self._lock:
+            entry = self._derived.get((key, name))
+            if entry is None:
+                return None
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
+                self._derived.pop((key, name), None)
+                return None
+            now = self._clock()
+            entry.used_at = now
+            if now - entry.touched_at >= TOUCH_EVERY_S:
+                entry.touched_at = now
+                try:
+                    os.utime(path, (now, now))
+                except OSError:
+                    pass
+            return data
+
+    def derived_bytes(self) -> int:
+        """Bytes held under ``derived``."""
+        with self._lock:
+            return sum(entry.size for entry in self._derived.values())
+
+    def _evict_derived(self, protect: tuple[str, str] | None = None) -> list[tuple[str, str]]:
+        """Remove least recently used derived files until their cap holds; `protect` stays."""
+        removed: list[tuple[str, str]] = []
+        total = sum(entry.size for entry in self._derived.values())
+        if total <= self.derived_max_bytes:
+            return removed
+        for pair in sorted(self._derived, key=lambda pair: (self._derived[pair].used_at, pair)):
+            if total <= self.derived_max_bytes:
+                break
+            if pair == protect:
+                continue
+            total -= self._derived.pop(pair).size
+            (self._derived_root / pair[0] / pair[1]).unlink(missing_ok=True)
+            removed.append(pair)
+        return removed
+
+    def _remove_derived(self, key: str) -> None:
+        """Remove every derived file of `key` (its field was evicted)."""
+        for pair in [pair for pair in self._derived if pair[0] == key]:
+            del self._derived[pair]
+        shutil.rmtree(self._derived_root / key, ignore_errors=True)
 
     # ------------------------------------------------------------------ pinned keys
     def pinned(self) -> frozenset[str]:

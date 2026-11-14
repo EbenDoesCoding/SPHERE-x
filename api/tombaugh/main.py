@@ -7,6 +7,14 @@ starts a build on the single worker thread, or joins the one already running for
 and answers 202 until the build is done. Recorded fields (`?fixture=NAME`) come straight from
 ``cache/fixtures`` and need no upstream.
 
+`GET /api/fields/{key}/overlays` (Contract 7.3) and `GET /api/fields/{key}/spectrum` (Contract 7.1) work for
+built and recorded fields alike; `{key}` is the manifest's content key (a recorded field's name is accepted
+too, as for frames.bin). Both answer in the request's own thread, never on the build worker, and keep what
+they fetched in the disk cache's derived files: the catalogue answer per key (final once both catalogues
+answered), the field's exposure list (written at build time, or found again from the archive for a recorded
+field), and each complete spectrum per key and snapped target. At most `SPECTRUM_SLOTS` spectra are measured
+at once; an identical request joins the one being measured.
+
 Settings, all optional environment variables:
 
     TOMBAUGH_CACHE_DIR, TOMBAUGH_CACHE_MAX_MB   the disk cache (see tombaugh.cache)
@@ -23,6 +31,7 @@ Durations are seconds unless a name says milliseconds.
 from __future__ import annotations
 
 import datetime as _dt
+import gzip
 import hmac
 import json
 import logging
@@ -34,6 +43,8 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,16 +54,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from tombaugh import CONTRACT_VERSION, __version__, http
+from tombaugh import CONTRACT_VERSION, __version__, catalogs, http, photometry
+from tombaugh import spectrum as spectra
 from tombaugh.build import (
     DEFAULT_DEADLINE_S,
+    MAX_EXPOSURES,
     AlreadyBuilt,
     BuildStats,
-    build_field_with_stats,
+    build_field_for_service,
     frames_version,
+    sample_exposures,
 )
 from tombaugh.cache import MB, REQUEST_TTL_S, FieldCache, compress_frames, is_key, request_id
-from tombaugh.discovery import BUCKET, REGION, SIA_URL, parse_sia_csv_counted
+from tombaugh.discovery import BUCKET, REGION, SIA_URL, discover, parse_sia_csv_counted
 from tombaugh.grid import ALLOWED_FOV, snap
 from tombaugh.models import (
     BuildingResponse,
@@ -61,11 +75,15 @@ from tombaugh.models import (
     ErrorResponse,
     Manifest,
     NewestExposure,
+    OverlaysResponse,
     Progress,
+    SnappedTo,
+    SpectrumResponse,
     StatusResponse,
     UpstreamHealth,
 )
 from tombaugh.timebins import mjd_to_date
+from tombaugh.types import Exposure
 
 DEFAULT_FOV = 6
 DEFAULT_CORS_ORIGINS = ("http://localhost:5173",)
@@ -81,6 +99,10 @@ IDLE_CANCEL_S = 20.0  # a build nobody has polled for this long is cancelled
 ERROR_TTL_S = 15.0  # how long a failed build keeps answering with its error before a new one may start
 RETRY_AFTER_QUEUE_S = 10
 POLL_AFTER_S = 1
+# Python's thread switch interval (default 5 ms). The reader threads of a build and of a spectrum parse FITS
+# headers in Python; with about 20 of them runnable, the event loop that answers /healthz waited its turn up
+# to 230 ms at the default (measured 14 Nov 2026, local server, cold spectra). See docs/ENGINE_NOTES.md.
+SWITCH_INTERVAL_S = 0.001
 RETRY_INCOMPLETE_S = 600.0  # a partial field, or one with failed downloads, is rebuilt after this long
 RETRY_STALE_S = 600.0  # an expired field served because the archive is down is retried after this long
 DEFAULT_RATE_BURST = 5.0
@@ -94,7 +116,28 @@ UPSTREAM_DOWN_MESSAGE = (
     "The SPHEREx archive cannot be reached right now and this field is not cached. Try again in a minute."
 )
 
+# Derived answers (disk cache, tombaugh.cache "derived" files). Names carry the pipeline version where the
+# code that makes them can change; an exposure list is what the archive listed, whatever the code.
+EXPOSURES_NAME = "exposures.json.gz"
+OVERLAYS_NAME = f"overlays-{__version__}.json.gz"
+OVERLAYS_RETRY_S = 300.0  # a catalogue that failed is asked again for the same key after this long
+FINAL_CACHE_CONTROL = "public, max-age=86400"  # a complete overlays or spectrum answer of a content key
+SPECTRUM_SLOTS = 2  # spectra measured at the same time; more answer 429
+SPECTRUM_DEADLINE_S = 60.0  # the photometry's reads stop here (Contract 7.1 sets none; measured 21 s for 258)
+SPECTRUM_DISCOVER_DEADLINE_S = 30.0  # finding a recorded field's exposures again
+SPECTRUM_JOIN_WAIT_S = 120.0  # how long an identical request waits for the measurement it joined
+RETRY_AFTER_SPECTRUM_S = 15
+INCOMPLETE_HEADER = "X-Tombaugh-Incomplete"  # says how many exposures a spectrum is missing (not cached)
+CATALOGUES_DOWN_MESSAGE = (
+    "The catalogues that place the source and its neighbours (Gaia DR3, CatWISE2020) cannot be reached "
+    "right now, so no spectrum can be measured honestly. Try again in a minute."
+)
+SPECTRUM_UPSTREAM_MESSAGE = "The SPHEREx archive could not be read for this spectrum. Try again in a minute."
+
 BuildFn = Callable[..., tuple[Manifest, bytes, BuildStats]]
+OverlaysFn = Callable[..., OverlaysResponse]
+MeasureFn = Callable[..., tuple]
+DiscoverFn = Callable[..., list[Exposure]]
 
 log = logging.getLogger("tombaugh.api")
 
@@ -199,6 +242,60 @@ def _frames_response(body: bytes, cache_control: str) -> Response:
     """The gzip bytes of a frame file, declared as such (Contract section 6)."""
     headers = {"Content-Encoding": "gzip", "Cache-Control": cache_control}
     return Response(body, media_type="application/octet-stream", headers=headers)
+
+
+def accepts_gzip(header: str | None) -> bool:
+    """True when an Accept-Encoding header allows gzip (by name or "*", with a q above zero)."""
+    for item in (header or "").split(","):
+        name, _, params = item.strip().partition(";")
+        if name.strip().lower() not in ("gzip", "*"):
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            key, _, value = param.strip().partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    quality = float(value)
+                except ValueError:
+                    quality = 0.0
+        if quality > 0.0:
+            return True
+    return False
+
+
+def _json_gz_response(
+    body_gz: bytes, request: Request, cache_control: str, headers: Mapping[str, str] | None = None
+) -> Response:
+    """A JSON body kept gzip-compressed: sent as it is when the client takes gzip, else unpacked."""
+    sent = {"Cache-Control": cache_control, "Vary": "Accept-Encoding", **(headers or {})}
+    if accepts_gzip(request.headers.get("accept-encoding")):
+        sent["Content-Encoding"] = "gzip"
+        return Response(body_gz, media_type="application/json", headers=sent)
+    return Response(gzip.decompress(body_gz), media_type="application/json", headers=sent)
+
+
+def _pack(data: bytes) -> bytes:
+    """The deterministic gzip of the cache (the same as for frame files)."""
+    return compress_frames(data)
+
+
+def _for_this_click(body_gz: bytes, snapped_to: SnappedTo | None) -> bytes:
+    """A measured spectrum (gzip JSON) as answered to one click: its `target.snapped_to` is this click's.
+
+    A spectrum is kept and shared per snapped source, and the separation between the click and the source
+    differs from click to click; nothing else in the answer depends on the click.
+    """
+    answer = SpectrumResponse.model_validate_json(gzip.decompress(body_gz))
+    if answer.target.snapped_to == snapped_to:
+        return body_gz
+    answer.target.snapped_to = snapped_to
+    return _pack(answer.model_dump_json().encode())
+
+
+def _still_asking() -> JSONResponse:
+    """429 for a request that joined a catalogue query which outlasted its wait."""
+    message = "The catalogues are still being asked for this field. Try again shortly."
+    return error_response(429, "busy", message, {"Retry-After": str(RETRY_AFTER_SPECTRUM_S)})
 
 
 _CODE_BY_STATUS = {400: "bad_request", 404: "not_found", 429: "busy", 503: "upstream_unavailable"}
@@ -532,8 +629,11 @@ class Builder:
                     error = (503, "upstream_unavailable", UPSTREAM_DOWN_MESSAGE)
                 log.warning("build %s: upstream error: %s", job.name, exc)
             else:
+                if stats.exposures:  # what the spectrum of this field will measure (see Service.spectrum)
+                    exposures = _pack(spectra.exposures_to_json(stats.exposures))
+                    cache.put_derived(manifest.key, EXPOSURES_NAME, exposures)
                 cache.put(manifest.key, manifest.model_dump_json().encode("utf-8"), frames or None)
-                incomplete = stats.timed_out > 0 or stats.failed > 0
+                incomplete = stats.timed_out > 0 or stats.failed > 0 or stats.legacy_incomplete
                 cache.remember(
                     ra0,
                     dec0,
@@ -626,17 +726,80 @@ class UpstreamProbes:
                 self._running = False
 
 
+# ------------------------------------------------------------------------------- overlays and spectra
+@dataclass(frozen=True)
+class FieldRef:
+    """A field that exists here: its content key and manifest, built (disk cache) or recorded."""
+
+    key: str
+    manifest: Manifest
+    recorded: bool
+
+
+class Busy(Exception):
+    """Every spectrum slot is taken (HTTP 429)."""
+
+
+@dataclass(frozen=True)
+class SpectrumResult:
+    """A measured spectrum: its JSON, gzip-compressed, and what it lacks when it is not complete."""
+
+    body_gz: bytes
+    missing: int = 0  # exposures not read (failed, or past the deadline) or without a point-spread function
+    requested: int = 0
+
+    @property
+    def complete(self) -> bool:
+        return self.missing == 0
+
+
+class SingleFlight:
+    """One computation per name at a time: later callers of the same name wait for the first one's result."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._running: dict[str, Future] = {}
+
+    def run(self, name: str, compute: Callable[[], object], wait_s: float) -> object:
+        with self._lock:
+            future = self._running.get(name)
+            owner = future is None
+            if owner:
+                future = self._running[name] = Future()
+        if not owner:
+            return future.result(timeout=wait_s)  # raises what the first caller raised
+        try:
+            result = compute()
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        else:
+            future.set_result(result)
+            return result
+        finally:
+            with self._lock:
+                self._running.pop(name, None)
+
+
 # --------------------------------------------------------------------------------------------- service
 class Service:
-    """Everything the routes share: settings, recorded fields, cache, build queue, limiter and probes."""
+    """Everything the routes share: settings, recorded fields, cache, build queue, limiter and probes.
+
+    `overlays`, `measure` and `discover` replace the catalogue queries (`catalogs.overlays_for_manifest`),
+    the photometry (`photometry.measure_with_stats`) and the archive search (`discovery.discover`); tests
+    pass stand-ins.
+    """
 
     def __init__(
         self,
         settings: Settings,
         *,
         cache: FieldCache | None = None,
-        build: BuildFn = build_field_with_stats,
+        build: BuildFn = build_field_for_service,
         probes: UpstreamProbes | None = None,
+        overlays: OverlaysFn = catalogs.overlays_for_manifest,
+        measure: MeasureFn = photometry.measure_with_stats,
+        discover: DiscoverFn = discover,
     ) -> None:
         self.settings = settings
         self.fixtures = Fixtures(settings.fixtures_dir or default_fixtures_dir())
@@ -645,6 +808,12 @@ class Service:
         self.builder = Builder(lambda: self.cache, build)
         self.limiter = RateLimiter(settings.rate_burst, settings.rate_per_minute)
         self.probes = probes or UpstreamProbes(DEFAULT_PROBES, enabled=settings.probe_upstreams)
+        self._overlays_fn = overlays
+        self._measure_fn = measure
+        self._discover_fn = discover
+        self._flights = SingleFlight()
+        self._overlays_tried: dict[str, float] = {}  # key -> monotonic time of the last catalogue query
+        self._spectrum_slots = threading.BoundedSemaphore(SPECTRUM_SLOTS)
 
     @property
     def cache(self) -> FieldCache:
@@ -778,11 +947,203 @@ class Service:
             ),
             upstreams=self.probes.snapshot(),
             cache=CacheStatus(
-                used_mb=round(self.cache.used_bytes() / MB), free_mb=round(self.cache.free_bytes() / MB)
+                used_mb=round((self.cache.used_bytes() + self.cache.derived_bytes()) / MB),
+                free_mb=round(self.cache.free_bytes() / MB),
             ),
             builds=BuildsStatus(active=active, queued=queued),
         )
         return JSONResponse(body.model_dump(), headers={"Cache-Control": NO_STORE})
+
+    # ---------------------------------------------------------------- fields by key
+    def field_ref(self, key: str) -> FieldRef | None:
+        """The field a key names: a built field in the disk cache, a recorded field with that content key, or
+        a recorded field by its name (as frames.bin accepts); None for anything else."""
+        if not isinstance(key, str):
+            return None
+        if is_key(key):
+            body = self.cache.get_manifest(key)
+            if body is not None:
+                return FieldRef(key, Manifest.model_validate_json(body), recorded=False)
+            fixture = self.fixtures.by_key(key)
+            if fixture is not None:
+                return FieldRef(key, Manifest.model_validate_json(fixture.manifest), recorded=True)
+            return None
+        if FIXTURE_NAME.fullmatch(key) is None:
+            return None
+        fixture = self.fixtures.get(key)
+        if fixture is None or not is_key(fixture.key):
+            return None
+        return FieldRef(fixture.key, Manifest.model_validate_json(fixture.manifest), recorded=True)
+
+    # ---------------------------------------------------------------- overlays (Contract 7.3)
+    def _cached_overlays(self, key: str) -> OverlaysResponse | None:
+        packed = self.cache.get_derived(key, OVERLAYS_NAME)
+        if packed is None:
+            return None
+        try:
+            return OverlaysResponse.model_validate_json(gzip.decompress(packed))
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _final(answer: OverlaysResponse) -> bool:
+        """Both catalogues answered: the answer holds for the key for good (both are fixed releases)."""
+        return answer.upstreams.gaia == "ok" and answer.upstreams.catwise == "ok"
+
+    def overlays(self, field: FieldRef) -> OverlaysResponse:
+        """The catalogue sources of a field: cached when final, else asked again (at most every 5 minutes)."""
+        cached = self._cached_overlays(field.key)
+        if cached is not None and self._final(cached):
+            return cached
+
+        def fetch() -> OverlaysResponse:
+            held = self._cached_overlays(field.key)  # another request may have just fetched it
+            tried = self._overlays_tried.get(field.key)
+            recent = tried is not None and time.monotonic() - tried < OVERLAYS_RETRY_S
+            if held is not None and (self._final(held) or recent):
+                return held
+            started = time.monotonic()
+            answer = self._overlays_fn(field.manifest, previous=held)
+            self._overlays_tried[field.key] = time.monotonic()
+            states = answer.upstreams
+            if states.gaia != "unavailable" or states.catwise != "unavailable":
+                self.cache.put_derived(field.key, OVERLAYS_NAME, _pack(answer.model_dump_json().encode()))
+            _log(
+                "overlays",
+                key=field.key,
+                gaia=states.gaia,
+                catwise=states.catwise,
+                n_gaia=len(answer.gaia),
+                n_catwise=len(answer.catwise),
+                seconds=round(time.monotonic() - started, 3),
+            )
+            return answer
+
+        return self._flights.run(f"overlays/{field.key}", fetch, catalogs.DEADLINE_S + 10.0)
+
+    def overlays_response(self, key: str, request: Request) -> Response:
+        field = self.field_ref(key)
+        if field is None:
+            return error_response(404, "not_found", "There is no field with that key.")
+        try:
+            answer = self.overlays(field)
+        except FutureTimeout:
+            return _still_asking()
+        cache_control = FINAL_CACHE_CONTROL if self._final(answer) else NO_STORE
+        return _json_gz_response(_pack(answer.model_dump_json().encode()), request, cache_control)
+
+    # ---------------------------------------------------------------- spectrum (Contract 7.1)
+    def field_exposures(self, field: FieldRef) -> list[Exposure]:
+        """The exposures a spectrum of the field measures, limited to the field's visits.
+
+        The list stored with a built field; otherwise (a recorded field, or a field built before the list was
+        kept) the archive is searched again at the field centre and sampled as a build samples, and the list
+        is stored. Raises http.UpstreamError when the archive cannot be searched.
+        """
+        packed = self.cache.get_derived(field.key, EXPOSURES_NAME)
+        exposures: list[Exposure] | None = None
+        if packed is not None:
+            try:
+                exposures = spectra.exposures_from_json(gzip.decompress(packed))
+            except (OSError, ValueError):
+                exposures = None
+        if exposures is None:
+            centre = field.manifest.centre
+            found = self._discover_fn(
+                centre.ra, centre.dec, deadline=http.Deadline(SPECTRUM_DISCOVER_DEADLINE_S)
+            )
+            exposures = sample_exposures(found, MAX_EXPOSURES)
+            self.cache.put_derived(field.key, EXPOSURES_NAME, _pack(spectra.exposures_to_json(exposures)))
+        return spectra.within_visits(exposures, field.manifest.time_bins)
+
+    def _measure(self, field: FieldRef, choice: spectra.Choice, name: str) -> SpectrumResult:
+        """Measure one spectrum (holding a slot) and keep it when it is complete."""
+        if not self._spectrum_slots.acquire(blocking=False):
+            raise Busy()
+        try:
+            started = time.monotonic()
+            exposures = self.field_exposures(field)
+            target = choice.target
+            response, stats = self._measure_fn(
+                exposures,
+                target.ra,
+                target.dec,
+                epoch=target.epoch,
+                pmra=target.pmra,
+                pmdec=target.pmdec,
+                parallax=target.parallax,
+                snapped_to=choice.snapped_to,
+                neighbours=choice.neighbours,
+                time_bins=field.manifest.time_bins,
+                deadline=http.Deadline(SPECTRUM_DEADLINE_S),
+            )
+            missing = stats.failed + stats.timed_out + stats.skipped.get(photometry.NO_PSF, 0)
+            result = SpectrumResult(_pack(response.model_dump_json().encode()), missing, stats.requested)
+            if result.complete:
+                self.cache.put_derived(field.key, name, result.body_gz)
+            _log(
+                "spectrum",
+                key=field.key,
+                target=choice.identity,
+                state=response.state,
+                points=len(response.points),
+                requested=stats.requested,
+                read=stats.read,
+                off_detector=stats.off_detector,
+                failed=stats.failed,
+                timed_out=stats.timed_out,
+                skipped=stats.skipped,
+                cached=result.complete,
+                seconds=round(time.monotonic() - started, 3),
+            )
+            return result
+        finally:
+            self._spectrum_slots.release()
+
+    def spectrum_response(self, key: str, params: Mapping[str, str], request: Request) -> Response:
+        """Contract 7.1: the spectrum at a position inside the field (200), or an error in the contract shape."""
+        field = self.field_ref(key)
+        if field is None:
+            return error_response(404, "not_found", "There is no field with that key.")
+        try:
+            ra = _number(params, "ra", 0.0, 360.0)
+            dec = _number(params, "dec", -90.0, 90.0)
+        except BadRequest as exc:
+            return error_response(400, "bad_request", str(exc))
+        if not spectra.inside_field(field.manifest, ra, dec):
+            return error_response(400, "bad_request", "'ra' and 'dec' must lie inside the field.")
+        try:
+            overlays = self.overlays(field)
+        except FutureTimeout:
+            return _still_asking()
+        if "unavailable" in (overlays.upstreams.gaia, overlays.upstreams.catwise):
+            return error_response(503, "upstream_unavailable", CATALOGUES_DOWN_MESSAGE)
+        choice = spectra.choose(overlays, field.manifest, ra, dec)
+        name = spectra.cache_name(choice.identity)
+        cached = self.cache.get_derived(field.key, name)
+        if cached is not None:
+            return _json_gz_response(_for_this_click(cached, choice.snapped_to), request, FINAL_CACHE_CONTROL)
+        try:
+            result = self._flights.run(
+                f"spectrum/{field.key}/{name}",
+                lambda: self._measure(field, choice, name),
+                SPECTRUM_JOIN_WAIT_S,
+            )
+        except Busy:
+            message = "Other spectra are being measured. Try again shortly."
+            headers = {"Retry-After": str(RETRY_AFTER_SPECTRUM_S)}
+            return error_response(429, "busy", message, headers)
+        except FutureTimeout:
+            message = "This spectrum is still being measured. Try again shortly."
+            return error_response(429, "busy", message, {"Retry-After": str(RETRY_AFTER_SPECTRUM_S)})
+        except http.UpstreamError as exc:
+            log.warning("spectrum %s %s: upstream error: %s", field.key, choice.identity, exc)
+            return error_response(503, "upstream_unavailable", SPECTRUM_UPSTREAM_MESSAGE)
+        body_gz = _for_this_click(result.body_gz, choice.snapped_to)  # a joined request may differ
+        if result.complete:
+            return _json_gz_response(body_gz, request, FINAL_CACHE_CONTROL)
+        note = f"{result.missing} of {result.requested} exposures not measured; not cached"
+        return _json_gz_response(body_gz, request, NO_STORE, {INCOMPLETE_HEADER: note})
 
 
 # ------------------------------------------------------------------------------------------------ app
@@ -794,13 +1155,26 @@ def create_app(
     settings: Settings | None = None,
     *,
     cache: FieldCache | None = None,
-    build: BuildFn = build_field_with_stats,
+    build: BuildFn = build_field_for_service,
     probes: UpstreamProbes | None = None,
+    overlays: OverlaysFn = catalogs.overlays_for_manifest,
+    measure: MeasureFn = photometry.measure_with_stats,
+    discover: DiscoverFn = discover,
 ) -> FastAPI:
-    """The FastAPI application. The keyword arguments replace the disk cache, the build and the probes."""
+    """The FastAPI application. The keyword arguments replace the disk cache, the build, the probes, the
+    catalogue queries, the photometry and the archive search (see `Service`)."""
     configure_logging()
+    sys.setswitchinterval(SWITCH_INTERVAL_S)
     settings = settings or Settings.from_env()
-    service = Service(settings, cache=cache, build=build, probes=probes)
+    service = Service(
+        settings,
+        cache=cache,
+        build=build,
+        probes=probes,
+        overlays=overlays,
+        measure=measure,
+        discover=discover,
+    )
     app = FastAPI(title="Tombaugh API", version=__version__, docs_url=None, redoc_url=None)
     app.state.service = service
 
@@ -872,12 +1246,12 @@ def create_app(
         return service.frames(key, v)
 
     @app.get("/api/fields/{key}/spectrum")
-    def spectrum(key: str) -> Response:
-        return _not_built("spectrum")
+    def spectrum(key: str, request: Request) -> Response:
+        return service.spectrum_response(key, request.query_params, request)
 
     @app.get("/api/fields/{key}/overlays")
-    def overlays(key: str) -> Response:
-        return _not_built("overlays")
+    def overlays_route(key: str, request: Request) -> Response:
+        return service.overlays_response(key, request)
 
     @app.get("/api/resolve")
     def resolve() -> Response:

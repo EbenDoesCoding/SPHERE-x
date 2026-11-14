@@ -100,6 +100,29 @@ const wise = loadRecorded("wise0855");
 const barnard = loadRecorded("barnard");
 const haveFixtures = wise !== null && barnard !== null;
 
+/**
+ * The recorded field minus its older-survey planes (and the provenance notes about them): the same
+ * real SPHEREx pixels, fewer planes. It stands for a field with no older-survey image, as a live
+ * build gives when the archives failed, or an engine older than pipeline 0.3.0.
+ */
+function withoutOlderSurveys(field: LoadedField): LoadedField {
+  const older = field.manifest.planes.filter((plane) => plane.kind === "legacy");
+  const missions = [...new Set(older.map((plane) => plane.mission))];
+  const planes = field.manifest.planes.filter((plane) => plane.kind !== "legacy");
+  const npix = field.synth.npix;
+  const values = new Float32Array(Math.max(...planes.map((plane) => plane.offset / 2 + npix)));
+  for (const plane of planes) values.set(field.synth.planeData(plane), plane.offset / 2);
+  const notes = field.manifest.provenance.notes.filter(
+    (note) => !missions.some((mission) => note.startsWith(`${mission} `)),
+  );
+  const manifest: Manifest = {
+    ...field.manifest,
+    planes,
+    provenance: { ...field.manifest.provenance, notes },
+  };
+  return { ...field, manifest, synth: new FieldSynth(manifest, values) };
+}
+
 const run = (state: ViewState, ...actions: Action[]) => actions.reduce(reduce, state);
 
 function opened(field: LoadedField, fallback = false): ViewState {
@@ -133,7 +156,13 @@ describe.skipIf(!haveFixtures)("notes under the view switch on the recorded fiel
   const fields = [wise, barnard] as LoadedField[];
 
   it("say why each greyed view is greyed, once each, in one line of the 362px rail", () => {
-    for (const field of fields) {
+    // The recorded fields hold older-survey images (pipeline 0.3.0); the same fields without them
+    // stand for a field that has none.
+    const cases = fields.flatMap((field) => [
+      { field, older: true },
+      { field: withoutOlderSurveys(field), older: false },
+    ]);
+    for (const { field, older } of cases) {
       for (const engine of ["up", "down"] as const) {
         for (const band of ["all", "cold", "rgb"] as const) {
           const vm = deriveView(run(opened(field), { type: "setBand", band }), {
@@ -147,8 +176,15 @@ describe.skipIf(!haveFixtures)("notes under the view switch on the recorded fiel
             .map((option) => viewBlocked(option.id, on.sequence, on.manifest));
           const notes = switchNotes(vm);
           expect(notes).toEqual([...new Set(greyed)]);
-          // Neither recorded field has an older-survey image: Then and now is greyed.
-          expect(notes).toContain(viewBlocked("then", on.sequence, on.manifest));
+          const then = vm.views.find((option) => option.id === "then");
+          if (older) {
+            // Then and now is offered, so nothing is said about it here.
+            expect(then?.disabled).toBe(false);
+            expect(notes.some((note) => note.startsWith("Then and now"))).toBe(false);
+          } else {
+            expect(then?.disabled).toBe(true);
+            expect(notes).toContain(THEN);
+          }
           for (const note of notes) expect(note.length).toBeLessThanOrEqual(ONE_LINE);
         }
       }
@@ -167,7 +203,12 @@ describe.skipIf(!haveFixtures)("notes under the view switch on the recorded fiel
     expect(greyedReason("blink", on)).toBeNull();
     expect(greyedReason("side", on)).toBeNull();
     expect(greyedReason("difference", on)).toBeNull();
-    expect(greyedReason("then", on)).toMatch(/^Then and now is greyed: /);
+    // The recorded field holds older-survey images: Then and now is not greyed.
+    expect(greyedReason("then", on)).toBeNull();
+    const bare = withoutOlderSurveys(field);
+    expect(
+      greyedReason("then", { sequence: sequenceOf(bare.synth, "cold"), manifest: bare.manifest }),
+    ).toBe(THEN);
     expect(greyedReason("then", null)).toBeNull();
     // One visit of the real field alone: nothing to set beside it or to subtract from it.
     const one = { sequence: sequence.slice(0, 1), manifest: field.manifest };

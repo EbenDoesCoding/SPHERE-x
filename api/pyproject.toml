@@ -1,6 +1,6 @@
 [project]
 name = "tombaugh"
-version = "0.2.0"
+version = "0.3.0"
 description = "Tombaugh API: registered, wavelength-matched SPHEREx stacks for any sky position. Built with AI assistance; see docs/AI_USE.md."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

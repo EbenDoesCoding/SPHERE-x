@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { FRAME_PX, HERO_PAIR, type Pair, type Picture, pictureUrl, TRY_PAIR } from "./pictures";
 
@@ -82,4 +82,19 @@ describe.each([
       expect(pictureUrl(picture)).toBe(`/landing/${picture.file}`);
     }
   });
+});
+
+/** The recorded fields bundled with the site (scripts/sync-contract.mjs copies them in). */
+const fixturesDir = new URL("../../public/fixtures/", import.meta.url);
+const manifestOf = (field: string) => new URL(`${field}/manifest.json`, fixturesDir);
+const bundled = records.every((record) => existsSync(manifestOf(record.field)));
+
+describe.skipIf(!bundled)("frames.json against the bundled recorded fields", () => {
+  it.each(records.map((record) => [record.file, record] as const))(
+    "%s names the key of the recorded field it belongs to",
+    (_file, record) => {
+      const manifest = JSON.parse(readFileSync(manifestOf(record.field), "utf8"));
+      expect(record.key).toBe(manifest.key);
+    },
+  );
 });

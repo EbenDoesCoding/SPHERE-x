@@ -4,7 +4,10 @@
  *
  * PORTS: Main.dc.html 424–498 (VIEW RAIL: the panel takes the place of Band, Field of view and
  *        Display at 1280; at 1440 Band stays, Blink-1440); Phone.dc.html 310–384 (under the
- *        playback); the SpectrumChart port is extras/chart.ts (bundle.js `spectrum`).
+ *        playback); the SpectrumChart port is extras/chart.ts (bundle.js `spectrum`). The chart
+ *        is drawn at its measured box: the panel's width and the height extras.css gives it, 24 px
+ *        and 4 px under the boards' at 1280 and 1440 (and the table 6 px under at 1280), so the
+ *        view rail holds the engine's warning notice and the whole provenance.
  * FLAGS: spectrum (off: never rendered; the ring row has no Spectrum button).
  * STATES: closed (null); loading ("Measuring…", or "Measuring 120 of 258" when the engine
  *         counts); ready (chart or table; "Indicative only: …", "A neighbour 7.5″ away may
@@ -29,7 +32,11 @@ const MODES: ReadonlyArray<{ id: SpectrumVM["mode"]; label: string }> = [
   { id: "table", label: "Table" },
 ];
 
-/** Chart sizes of the boards (Main.dc.html: 328 × 190 at 1280, 349 × 136 at 1440; phone 324 × 200). */
+/**
+ * Chart sizes of the boards (Main.dc.html: 328 × 190 at 1280, 349 × 136 at 1440; phone 324 × 200),
+ * drawn only until the chart's own box is measured: its width is the panel's, its height
+ * extras.css's for the layout.
+ */
 function chartSize(layout: ViewModel["layout"]): { width: number; height: number } {
   if (layout === "wide") return { width: 349, height: 136 };
   if (layout === "three") return { width: 328, height: 190 };
@@ -46,24 +53,32 @@ function bandSpan(band: BandId): [number, number] | null {
 
 const signed = (text: string) => (text.startsWith("-") ? `${MINUS}${text.slice(1)}` : text);
 
-/** Width of an element, CSS px, kept current. */
-function useWidth(fallback: number): [number, (element: HTMLElement | null) => void] {
-  const [width, setWidth] = useState(fallback);
+interface Box {
+  width: number;
+  height: number;
+}
+
+/** Width and height of an element, CSS px, kept current. */
+function useBox(fallback: Box): [Box, (element: Element | null) => void] {
+  const [box, setBox] = useState(fallback);
   const observer = useRef<ResizeObserver | null>(null);
-  const measure = useCallback((element: HTMLElement | null) => {
+  const measure = useCallback((element: Element | null) => {
     observer.current?.disconnect();
     observer.current = null;
     if (!element) return;
     const read = () => {
-      const w = Math.floor(element.getBoundingClientRect().width);
-      if (w >= 160) setWidth(w);
+      const rect = element.getBoundingClientRect();
+      const width = Math.floor(rect.width);
+      const height = Math.floor(rect.height);
+      if (width < 160 || height < 1) return;
+      setBox((old) => (old.width === width && old.height === height ? old : { width, height }));
     };
     observer.current = new ResizeObserver(read);
     observer.current.observe(element);
     read();
   }, []);
   useEffect(() => () => observer.current?.disconnect(), []);
-  return [width, measure];
+  return [box, measure];
 }
 
 /** Chart or Table: one Tab stop, arrows move and select, wrapping, Home and End. */
@@ -156,16 +171,17 @@ function Legend({ spectrum }: { spectrum: SpectrumVM }) {
 
 function Chart({ vm }: { vm: ViewModel }) {
   const spectrum = vm.extras.spectrum;
-  const size = chartSize(vm.layout);
-  const [width, measure] = useWidth(size.width);
+  // The chart is drawn at its own box: the panel's width, and the height extras.css gives it.
+  const [box, measure] = useBox(chartSize(vm.layout));
   const band = vm.field ? bandSpan(vm.field.band) : null;
-  const g = chartGeometry(spectrum, width, size.height, band);
+  const g = chartGeometry(spectrum, box.width, box.height, band);
   const outside = outsideNote(g.outside);
   const visits = spectrum.visits.length;
   const clipId = `${useId()}-plot`;
   return (
-    <div className="bc-stack" ref={measure}>
+    <div className="bc-stack">
       <svg
+        ref={measure}
         className="bc-chart"
         role="img"
         viewBox={g.viewBox}
