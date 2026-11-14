@@ -3,6 +3,14 @@
 discover -> sample -> read windows -> prepare -> register -> time bins -> stack -> encode -> manifest
 (Contract v1.0, sections 2 to 6). Nothing here touches the disk; the cache and the HTTP service call it.
 
+With `legacy_bands` (the service and make_fixture pass `tombaugh.legacy.LEGACY_BANDS`), the older-survey
+planes of Then & Now (AllWISE W1/W2, 2MASS J/H/Ks; `tombaugh.legacy`) are made on a side thread while the
+SPHEREx windows are read (IRSA serves them, the bucket serves SPHEREx), scaled on field stars to the paired
+SPHEREx frame once the stacks exist, and appended after the SPHEREx planes (Contract sections 5 and 6). A plane
+that could not be scaled on field stars is left out, because the contract says every legacy plane is
+"scaled": "field_stars". Any failure there only costs those planes: the field is built without them and a
+warning says so.
+
 Units: positions in ICRS decimal degrees, fields of view in arcmin, times in MJD days (UTC), wavelengths in
 micron, images in MJy/sr, durations in seconds.
 
@@ -23,14 +31,15 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from tombaugh import CONTRACT_VERSION, __version__, http, prepare, presets, remote_fits
+from tombaugh import CONTRACT_VERSION, __version__, http, legacy, prepare, presets, remote_fits
 from tombaugh.discovery import discover
 from tombaugh.frames import encode_planes, plane_offset, sha256_hex
 from tombaugh.grid import ALLOWED_FOV, NATIVE_PIXSCALE_ARCSEC, PIXSCALE_ARCSEC, Grid, native_half_window
@@ -63,7 +72,11 @@ STACK_RESERVE_S = 10.0  # time kept back from the deadline for preparing, regist
 STACK_RESERVE_FRACTION = 0.15  # ... but never more than this share of the deadline
 SPARSE_BIN_EXPOSURES = 15  # a time bin with fewer exposures gets a warning
 SATURATION_RADIUS_ARCSEC = 15.0  # "saturated core within 15 arcsec of the centre"
+CORE_BLANK = "blank"  # a saturated core with no value: nothing can be measured there
+CORE_OVERFLOW = "overflow"  # OVERFLOW on the core, but every core pixel has a value: indicative only
 STACK_PROGRESS_EVERY = 16  # exposures between two progress calls of the stack stage
+LEGACY_DEADLINE_S = legacy.DEFAULT_DEADLINE_S  # the older-survey planes get at most this long ...
+LEGACY_RESERVE_S = 5.0  # ... and are not waited for in the last seconds before the build's deadline
 DATA_DOIS = ("10.26131/IRSA678", "10.26131/IRSA662")  # SPHEREx DR1 and QR3 spectral images
 NOTE_RESAMPLED = (
     f'resampled to {PIXSCALE_ARCSEC}"/px; native pixel {NATIVE_PIXSCALE_ARCSEC}"; resolution about 10"'
@@ -118,12 +131,17 @@ class BuildStats:
     time_bins: int = 0
     frames_nbytes: int = 0
     newest_found_mjd: float | None = None
+    legacy_planes: int = 0  # older-survey planes in the manifest
+    legacy_left_out: int = 0  # older-survey planes made but left out (not scaled on field stars, or unusable)
+    legacy_incomplete: bool = False  # an upstream of the older surveys failed: worth building again soon
     seconds: dict[str, float] = field(default_factory=dict)
     http: dict[str, int] = field(default_factory=dict)
+    exposures: list[Exposure] = field(default_factory=list, repr=False)  # the selected exposures, read or not
 
     def as_log(self) -> dict:
-        """The one-line JSON record of this build."""
+        """The one-line JSON record of this build (the exposure list is left out)."""
         record = {"event": "build", **self.__dict__}
+        record.pop("exposures", None)
         record["seconds"] = {name: round(value, 3) for name, value in self.seconds.items()}
         return record
 
@@ -313,6 +331,7 @@ def assemble_manifest(
     warnings: Sequence[str] = (),
     notes: Sequence[str] = (),
     built_at: str | None = None,
+    legacy_planes: Sequence[legacy.LegacyPlane] = (),
 ) -> tuple[Manifest, bytes]:
     """The manifest of Contract section 5 and the bytes of frames.bin for stacked planes.
 
@@ -320,11 +339,22 @@ def assemble_manifest(
     the number of exposures the archive lists. Without planes the manifest has status "empty", no planes
     and `frames` null, and the bytes are empty. The key is `field_key` over the uids of `items`. `built_at`
     (ISO 8601 UTC) defaults to now.
+
+    `legacy_planes` (older-survey planes on the same grid, `tombaugh.legacy`) follow the SPHEREx planes in
+    the order given, in the manifest and in frames.bin; they are dropped when there is no SPHEREx plane, and
+    they never enter the key (it names the SPHEREx exposures; the version in it names the pipeline).
     """
     ordered = sorted(planes, key=lambda plane: (plane.time_bin, plane.wave_bin))
     stacked = list(items) if ordered else []
+    extra = list(legacy_planes) if ordered else []
     key = field_key(grid.ra0, grid.dec0, fov_arcmin, [item.exposure.uid for item in stacked])
-    frames = encode_planes(ordered) if ordered else b""
+    plane_models = _plane_models(ordered, grid)
+    plane_models += [plane.plane_model(len(ordered) + k, grid) for k, plane in enumerate(extra)]
+    frames = (
+        encode_planes([*(plane.data for plane in ordered), *(plane.data for plane in extra)])
+        if ordered
+        else b""
+    )
     info = None
     if ordered:
         digest = sha256_hex(frames)
@@ -341,7 +371,7 @@ def assemble_manifest(
         ),
         time_bins=_time_bin_models(stacked),
         wave_bins=presets.wave_bins(),
-        planes=_plane_models(ordered, grid),
+        planes=plane_models,
         frames=info,
         exposures=_exposures_info(stacked, found, sampled),
         provenance=Provenance(
@@ -356,24 +386,32 @@ def assemble_manifest(
 
 
 # ------------------------------------------------------------------------------- exposures to planes
-def _saturated_near_centre(cut: Cutout) -> bool:
-    """True when a saturated pixel lies within 15 arcsec of the window centre.
+def _core_near_centre(cut: Cutout) -> str | None:
+    """What a bright core within 15 arcsec of the window centre does to the measurement there.
 
-    Saturated means the OVERFLOW flag, or a pixel without a value that belongs to a saturated core.
+    * CORE_BLANK: a pixel of a saturated core has no value (`prepare.core_mask`, without a value): the core
+      is blank, so no brightness can be read there ("saturated");
+    * CORE_OVERFLOW: pixels there carry the OVERFLOW flag, but no core pixel is blank: the values exist and
+      are indicative only;
+    * None: neither.
     """
     if cut.flags is None:
-        return False
+        return None
     flags = np.asarray(cut.flags).astype(np.int64, copy=False)
     image = np.asarray(cut.image)
-    core = prepare.core_mask(image, flags)
-    saturated = ((flags & prepare.bit_mask(prepare.OVERFLOW)) != 0) | (core & ~np.isfinite(image))
-    if not saturated.any():
-        return False
+    blank = prepare.core_mask(image, flags) & ~np.isfinite(image)
+    overflow = (flags & prepare.bit_mask(prepare.OVERFLOW)) != 0
+    if not (blank.any() or overflow.any()):
+        return None
     rows, cols = np.indices(image.shape, dtype=np.float64)
     centre_row, centre_col = (image.shape[0] - 1) / 2.0, (image.shape[1] - 1) / 2.0
     radius_px = SATURATION_RADIUS_ARCSEC / NATIVE_PIXSCALE_ARCSEC
     near = np.hypot(rows - centre_row, cols - centre_col) <= radius_px
-    return bool((saturated & near).any())
+    if (blank & near).any():
+        return CORE_BLANK
+    if (overflow & near).any():
+        return CORE_OVERFLOW
+    return None
 
 
 def _register_one(cut: Cutout, grid: Grid, time_bin: int) -> Registered | None:
@@ -404,7 +442,11 @@ def _renumber_time_bins(items: Sequence[Registered]) -> None:
 
 
 def register_cutouts(
-    cutouts: Sequence[Cutout], grid: Grid, progress: ProgressFn | None = None
+    cutouts: Sequence[Cutout],
+    grid: Grid,
+    progress: ProgressFn | None = None,
+    *,
+    cores: Counter[str] | None = None,
 ) -> tuple[list[Registered], int, int]:
     """Give every cutout its time bin, then prepare and register it.
 
@@ -414,14 +456,18 @@ def register_cutouts(
 
     Returns (items, unusable, saturated): the registered exposures, the number of cutouts that could not
     contribute (unknown noise, no valid pixel on the grid, or a header that could not be used), and the
-    number with a saturated pixel within 15 arcsec of the centre.
+    number whose saturated core within 15 arcsec of the centre is blank. `cores`, when given, counts the
+    exposures per `_core_near_centre` outcome (CORE_BLANK, CORE_OVERFLOW).
     """
     bins = assign_time_bins([cut.mjd for cut in cutouts])
     items: list[Registered] = []
     unusable = saturated = 0
     for count, (cut, time_bin) in enumerate(zip(cutouts, bins, strict=True), start=1):
         try:
-            saturated += _saturated_near_centre(cut)
+            core = _core_near_centre(cut)
+            saturated += core == CORE_BLANK
+            if cores is not None and core is not None:
+                cores[core] += 1
             item = _register_one(cut, grid, int(time_bin))
         except (ValueError, ArithmeticError) as exc:
             log.warning("exposure %s could not be registered: %s", cut.exposure.uid, exc)
@@ -485,8 +531,21 @@ def _stack_reserve(deadline_s: float) -> float:
     return min(STACK_RESERVE_S, STACK_RESERVE_FRACTION * deadline_s)
 
 
-def _warnings(stats: BuildStats, saturated: int, deadline_s: float, bins: Sequence[TimeBin]) -> list[str]:
-    """Plain-language warnings of a build, most important first."""
+def visit_label(time_bin: TimeBin) -> str:
+    """How a warning names a visit: by its dates, never by its id ("the visit of 2025-09-30 to 2025-10-01")."""
+    if time_bin.date_start == time_bin.date_end:
+        return f"the visit of {time_bin.date_start}"
+    return f"the visit of {time_bin.date_start} to {time_bin.date_end}"
+
+
+def _warnings(
+    stats: BuildStats, cores: Mapping[str, int], deadline_s: float, bins: Sequence[TimeBin]
+) -> list[str]:
+    """Plain-language warnings of a build, most important first.
+
+    `cores` counts the exposures by what a bright core within 15 arcsec of the centre does there
+    (`_core_near_centre`): CORE_BLANK (saturated: no value) and CORE_OVERFLOW (flagged, but measured).
+    """
     out: list[str] = []
     if stats.timed_out:
         out.append(
@@ -499,14 +558,20 @@ def _warnings(stats: BuildStats, saturated: int, deadline_s: float, bins: Sequen
         out.append(
             f"{_count(stats.unusable, 'exposure')} could not be used (no valid pixel or unknown noise)"
         )
-    if saturated:
+    within = f"within {SATURATION_RADIUS_ARCSEC:g} arcsec of the centre"
+    if cores.get(CORE_BLANK, 0):
         out.append(
-            f"saturated core within {SATURATION_RADIUS_ARCSEC:g} arcsec of the centre "
-            f"in {saturated} of {_count(stats.read, 'exposure')}"
+            f"saturated core {within} in {cores[CORE_BLANK]} of {_count(stats.read, 'exposure')}: "
+            "those pixels have no value, so no brightness can be read there"
+        )
+    if cores.get(CORE_OVERFLOW, 0):
+        out.append(
+            f"bright core {within} flagged as overflowing in {cores[CORE_OVERFLOW]} of "
+            f"{_count(stats.read, 'exposure')}, but measured: brightness there is indicative only"
         )
     for time_bin in bins:
         if time_bin.n_exposures < SPARSE_BIN_EXPOSURES:
-            out.append(f"time bin {time_bin.id} has only {_count(time_bin.n_exposures, 'exposure')}")
+            out.append(f"{visit_label(time_bin)} has only {_count(time_bin.n_exposures, 'exposure')}")
     return out
 
 
@@ -539,6 +604,132 @@ def _notes(stats: BuildStats, cutouts: Sequence[Cutout]) -> list[str]:
     return out
 
 
+# ----------------------------------------------------------------------------------- older-survey planes
+class _StoppableDeadline(http.Deadline):
+    """A deadline that the build can also end early, so the side thread's requests stop at once."""
+
+    def __init__(self, seconds: float, stop: threading.Event) -> None:
+        super().__init__(seconds)
+        self._stop = stop
+
+    def remaining(self) -> float:
+        return 0.0 if self._stop.is_set() else super().remaining()
+
+    @property
+    def expired(self) -> bool:
+        return self._stop.is_set() or super().expired
+
+
+# Words of tombaugh.legacy's warnings that name an upstream failure (a later build may do better), as opposed
+# to the sky (no image covers the field, too few field stars): "<mission>: archive unavailable (...)" and
+# "<mission> <band>: <n> image(s) not read (...)".
+_LEGACY_UPSTREAM_FAILURE = (": archive unavailable (", " image(s) not read (")
+
+
+@dataclass
+class LegacyOutcome:
+    """The older-survey planes a build keeps, with what the manifest says about them."""
+
+    planes: list[legacy.LegacyPlane] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    left_out: int = 0
+    incomplete: bool = False  # an upstream failed or the planes were not ready in time
+    seconds: float = 0.0
+
+
+def keep_legacy_planes(result: legacy.LegacyResult, grid: Grid) -> LegacyOutcome:
+    """Which planes of a `legacy.LegacyResult` go into the manifest, and the words that go with them.
+
+    A plane is kept only when it was scaled on field stars (Contract section 5: every legacy plane is
+    "scaled": "field_stars") and its manifest entry is valid (finite numbers). A plane left out is replaced
+    by a warning that says why; its own "not scaled ... values in DN" warning is dropped with it.
+    """
+    outcome = LegacyOutcome(seconds=float(result.seconds))
+    dropped_words: set[str] = set()
+    for plane in result.planes:
+        label = f"{plane.mission} {plane.band}"
+        reason = ""
+        if plane.scaled != "field_stars":
+            reason = "its brightness could not be matched to SPHEREx on field stars"
+        else:
+            try:
+                plane.plane_model(0, grid)
+            except ValueError as exc:  # pydantic refuses NaN and infinity
+                reason = f"its description is not valid ({type(exc).__name__})"
+        if reason:
+            dropped_words.update(plane.warnings)
+            outcome.left_out += 1
+            outcome.warnings.append(f"{label}: plane left out: {reason}.")
+            continue
+        outcome.planes.append(plane)
+        outcome.notes.extend(plane.notes)
+    outcome.warnings = [w for w in result.warnings if w not in dropped_words] + outcome.warnings
+    outcome.incomplete = any(part in w for w in result.warnings for part in _LEGACY_UPSTREAM_FAILURE)
+    return outcome
+
+
+class _LegacyJob:
+    """`legacy.build_legacy_planes` on a side thread, started while the SPHEREx windows are read.
+
+    The paired SPHEREx frames that scale the planes exist only after stacking, so the thread's `references`
+    callback waits for `finish` to hand the stacked planes over. `deadline_s` bounds the older surveys'
+    requests; the wait for the stacks is bounded by the build's own deadline (`stacks_by`), never by the
+    requests' (regression: a field whose SPHEREx reads took 55 s lost every legacy plane, its references
+    having timed out with the 60 s request deadline).
+    """
+
+    def __init__(self, grid: Grid, bands: Sequence[str], deadline_s: float, stacks_by: http.Deadline) -> None:
+        self._grid = grid
+        self._bands = tuple(bands)
+        self._stop = threading.Event()
+        self._deadline = _StoppableDeadline(deadline_s, self._stop)
+        self._stacks_by = stacks_by
+        self._stacked = threading.Event()
+        self._planes: list[StackedPlane] = []
+        self._result: legacy.LegacyResult | None = None
+        self._error = ""
+        self._thread = threading.Thread(target=self._run, name="tombaugh-legacy", daemon=True)
+        self._thread.start()
+
+    def _reference(self, band: str) -> np.ndarray | None:
+        if not self._stacked.wait(self._stacks_by.remaining()) or self._stop.is_set() or not self._planes:
+            return None
+        return legacy.paired_reference(self._planes, band)
+
+    def _run(self) -> None:
+        try:
+            self._result = legacy.build_legacy_planes(
+                self._grid, self._bands, references=self._reference, deadline=self._deadline
+            )
+        except Exception as exc:  # the older surveys must never take the field down with them
+            log.exception("older-survey planes failed")
+            self._error = type(exc).__name__
+
+    def cancel(self) -> None:
+        """Stop the side thread's requests and let it end (idempotent)."""
+        self._stop.set()
+        self._stacked.set()
+
+    def finish(self, planes: Sequence[StackedPlane], wait_s: float) -> LegacyOutcome:
+        """Hand over the SPHEREx stacks, wait at most `wait_s` seconds, and say what is kept."""
+        self._planes = list(planes)
+        self._stacked.set()
+        self._thread.join(timeout=max(0.0, wait_s))
+        if self._thread.is_alive():
+            self.cancel()
+            return LegacyOutcome(
+                warnings=["older-survey planes (AllWISE, 2MASS) were not ready before the build's deadline"],
+                incomplete=True,
+            )
+        if self._result is None:
+            return LegacyOutcome(
+                warnings=[f"older-survey planes (AllWISE, 2MASS) could not be made ({self._error})"],
+                incomplete=True,
+            )
+        return keep_legacy_planes(self._result, self._grid)
+
+
 def _split_failures(failures: Sequence[tuple[Exposure, str]], stats: BuildStats) -> str:
     """Count the reader's failures by kind into `stats`; return the first download error, "" if none."""
     first_error = ""
@@ -562,16 +753,20 @@ def build_field_with_stats(
     deadline_s: float = DEFAULT_DEADLINE_S,
     max_exposures: int = MAX_EXPOSURES,
     known: Callable[[str], bool] | None = None,
+    legacy_bands: Sequence[str] = (),
 ) -> tuple[Manifest, bytes, BuildStats]:
     """`build_field`, also returning what the build did (counts and seconds per stage)."""
     if fov_arcmin not in ALLOWED_FOV:
         raise ValueError(f"fov_arcmin must be one of {ALLOWED_FOV}, got {fov_arcmin!r}")
+    for band in legacy_bands:
+        legacy.mission_of(band)  # KeyError for a band presets.json does not pair, before anything is sent
     fov = int(fov_arcmin)
     grid = Grid.for_field(ra, dec, fov)
     stats = BuildStats()
     before = http.stats()
     clock = time.monotonic()
     started = clock
+    build_deadline = http.Deadline(deadline_s)
     limit = http.Deadline(max(0.0, deadline_s - _stack_reserve(deadline_s)))
 
     def lap(stage: str) -> None:
@@ -593,32 +788,47 @@ def build_field_with_stats(
 
     selected = sample_exposures(found, max_exposures)
     stats.selected = len(selected)
+    stats.exposures = list(selected)
     stats.listing_key = field_key(grid.ra0, grid.dec0, fov, [exposure.uid for exposure in selected])
     if known is not None and selected and known(stats.listing_key):
         raise AlreadyBuilt(stats.listing_key)  # the same exposures were listed before: nothing would change
-    report("fetch", 0, len(selected))
-    cutouts, failures = remote_fits.read_windows(
-        selected,
-        grid.ra0,
-        grid.dec0,
-        native_half_window(fov),
-        workers=READ_WORKERS,
-        deadline=limit,
-        progress=lambda done, total: report("fetch", done, total),
-    )
-    lap("fetch")
-    stats.read = len(cutouts)
-    first_error = _split_failures(failures, stats)
-    if selected and not cutouts and (stats.failed or stats.timed_out):
-        raise http.UpstreamError(
-            f"none of the {_count(len(selected), 'exposure')} could be read"
-            + (f": {first_error}" if first_error else " before the deadline")
+    side = None
+    if legacy_bands and selected:  # other hosts than the bucket: run alongside the SPHEREx reads
+        side = _LegacyJob(grid, legacy_bands, min(LEGACY_DEADLINE_S, limit.remaining()), build_deadline)
+    try:
+        report("fetch", 0, len(selected))
+        cutouts, failures = remote_fits.read_windows(
+            selected,
+            grid.ra0,
+            grid.dec0,
+            native_half_window(fov),
+            workers=READ_WORKERS,
+            deadline=limit,
+            progress=lambda done, total: report("fetch", done, total),
         )
+        lap("fetch")
+        stats.read = len(cutouts)
+        first_error = _split_failures(failures, stats)
+        if selected and not cutouts and (stats.failed or stats.timed_out):
+            raise http.UpstreamError(
+                f"none of the {_count(len(selected), 'exposure')} could be read"
+                + (f": {first_error}" if first_error else " before the deadline")
+            )
 
-    report("stack", 0, len(cutouts))
-    items, stats.unusable, saturated = register_cutouts(cutouts, grid, progress)
-    items, stats.helium_left_out, stats.helium_planes = leave_out_helium(items, cutouts)
-    planes, _events = stack_planes(items)
+        report("stack", 0, len(cutouts))
+        cores: Counter[str] = Counter()
+        items, stats.unusable, _ = register_cutouts(cutouts, grid, progress, cores=cores)
+        items, stats.helium_left_out, stats.helium_planes = leave_out_helium(items, cutouts)
+        planes, _events = stack_planes(items)
+        older = LegacyOutcome()
+        if side is not None and planes:
+            older = side.finish(planes, build_deadline.remaining() - LEGACY_RESERVE_S)
+            stats.seconds["legacy"] = older.seconds
+    finally:
+        if side is not None:
+            side.cancel()
+    stats.legacy_planes, stats.legacy_left_out = len(older.planes), older.left_out
+    stats.legacy_incomplete = older.incomplete
     manifest, frames = assemble_manifest(
         ra,
         dec,
@@ -629,9 +839,13 @@ def build_field_with_stats(
         found=len(found),
         sampled=len(selected) < len(found),
         partial=stats.timed_out > 0,
+        legacy_planes=older.planes,
     )
-    manifest.warnings = _warnings(stats, saturated, deadline_s, manifest.time_bins)
+    manifest.warnings = _warnings(stats, cores, deadline_s, manifest.time_bins)
     manifest.provenance.notes.extend(_notes(stats, cutouts))
+    if manifest.planes:
+        manifest.warnings.extend(older.warnings)
+        manifest.provenance.notes.extend(older.notes)
     report("stack", len(cutouts), len(cutouts))
     lap("stack")
 
@@ -654,6 +868,7 @@ def build_field(
     deadline_s: float = DEFAULT_DEADLINE_S,
     max_exposures: int = MAX_EXPOSURES,
     known: Callable[[str], bool] | None = None,
+    legacy_bands: Sequence[str] = (),
 ) -> tuple[Manifest, bytes]:
     """Build the field around a sky position: (manifest, bytes of frames.bin).
 
@@ -669,9 +884,12 @@ def build_field(
       a complete build of exactly the exposures about to be read gave. The listing key is `field_key` over
       those exposures; it differs from the field's own key as soon as one of them is not used (off the
       detector, unusable). If the answer is yes, `AlreadyBuilt` is raised and nothing is read.
+    * `legacy_bands` (contract bands, `legacy.LEGACY_BANDS` for all five) adds the older-survey planes after
+      the SPHEREx planes: made while the SPHEREx windows are read, scaled on field stars, left out with a
+      warning when that fails. The default adds none.
 
-    Raises ValueError for a position or field of view out of range and `http.UpstreamError` when the archive
-    cannot be searched or none of the exposures can be read.
+    Raises ValueError for a position or field of view out of range, KeyError for an unknown legacy band, and
+    `http.UpstreamError` when the archive cannot be searched or none of the exposures can be read.
     """
     manifest, frames, _ = build_field_with_stats(
         ra,
@@ -681,5 +899,14 @@ def build_field(
         deadline_s=deadline_s,
         max_exposures=max_exposures,
         known=known,
+        legacy_bands=legacy_bands,
     )
     return manifest, frames
+
+
+def build_field_for_service(
+    ra: float, dec: float, fov_arcmin: int, **kwargs
+) -> tuple[Manifest, bytes, BuildStats]:
+    """What the HTTP service builds: `build_field_with_stats` with every older-survey band."""
+    kwargs.setdefault("legacy_bands", legacy.LEGACY_BANDS)
+    return build_field_with_stats(ra, dec, fov_arcmin, **kwargs)

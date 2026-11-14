@@ -132,7 +132,8 @@ A frame is **partial** when its set of contributing wave bins differs from the u
 
 - `status: "empty"` (HTTP 200) means no public SPHEREx exposure covers the position. `planes` is empty and `frames` is null. This is a normal, honest answer, not an error.
 - `status: "partial"` means the build hit its deadline; `warnings` says what is missing.
-- `kind` is `"sci"` for SPHEREx stacks and `"legacy"` for Then & Now planes. A legacy plane has `mission` `"AllWISE"` or `"2MASS"`, a `band` (`"W1"`, `"W2"`, `"J"`, `"H"`, `"Ks"`), `time_bin: null`, `wave_bin: null`, its own dates, and `"scaled": "field_stars"`. Its brightness is not comparable with SPHEREx; only positions are.
+- `kind` is `"sci"` for SPHEREx stacks and `"legacy"` for Then & Now planes. A legacy plane has `mission` `"AllWISE"` or `"2MASS"`, a `band` (`"W1"`, `"W2"`, `"J"`, `"H"`, `"Ks"`), `time_bin: null`, `wave_bin: null`, its own dates, and `"scaled": "field_stars"`. Its brightness is not comparable with SPHEREx; only positions are. Since pipeline 0.3.0 legacy planes follow every SPHEREx plane (in the band order above); a band whose survey image could not be fetched, or whose brightness could not be matched on field stars, is left out and `warnings` says so (clarified on 14 Nov 2026).
+- A legacy plane's values are the survey image (its background removed) times one gain: the median ratio of the aperture fluxes of unsaturated field stars found both in the plane and in its paired SPHEREx frame (`legacy_pairs` in `presets.json`). They are therefore on that frame's MJy/sr scale for display only, not a photometric calibration (bands, beams and epochs differ), and `sigma` is on the same scale. A plane that cannot be scaled so is not served in the survey's own unit; whether it may be is the data/backend owner's decision (clarified on 14 Nov 2026).
 - `frames.url` is opaque: fetch it exactly as given and never build it from `key`. Since pipeline 0.2.0 it ends in `?v=<first 16 hex characters of frames.sha256>`, so that one URL always names the same bytes (clarified on 14 Nov 2026; a v1.0 client that follows `frames.url` needs no change).
 - Fixture manifests add `fixture_stars`: three Gaia DR3 stars as `{ "source_id", "ra", "dec", "x", "y" }` at the fixture's reference date, for decoder and grid tests.
 
@@ -199,11 +200,15 @@ Base path `/api`. All responses are JSON except `frames.bin`.
 }
 ```
 
+- `snapped_to.catalog` names where the target's astrometry came from: `"gaia"`, `"catwise"`, or, for an object whose published astrometry the server holds, the service it was read from (`"simbad"` for WISE 0855). `snapped_to` is null when no source lies within one native pixel (6.15") of the click; the click is then measured where it is (clarified on 14 Nov 2026).
+- A spectrum that misses exposures (a read failed, or the deadline passed) is answered with `Cache-Control: no-store` and the header `X-Tombaugh-Incomplete: <n> of <m> exposures not measured; not cached`; its JSON is unchanged. `upstream_unavailable` (503) also answers when the catalogues that place the target and its neighbours cannot be reached, and `busy` (429) when other spectra are being measured (clarified on 14 Nov 2026).
 - `state: "saturated"` means the core is blank in the data: `points` is empty and the client shows "saturated: no reliable photometry".
 - `state: "indicative"` means the core carries the OVERFLOW flag: points are returned with `quality: "saturated"` and drawn hollow.
 - `state: "contaminated"` means a catalogued neighbour lies within 15" and could not be fitted jointly.
 - `quality` is `"good"`, `"flagged"` or `"saturated"`. `flags` is the SPHEREx bit mask OR-ed over the aperture.
 - `err_ujy` already includes the 3% systematic floor in quadrature.
+- A `binned` value's `err_ujy` also includes, in quadrature, a background term of its detector (25 µJy for detectors 1–4, 35 µJy for 5–6, measured on blank sky) and the bin's measured annulus skew (large in crowded fields): the sky under a faint source is not known better than that, and averaging exposures does not remove it. `lam_min`/`lam_max` are the wave bin's edges, widened to the members' own `lam` where a point lies just beyond its detector's nominal range, so `lam` always lies between them (clarified on 14 Nov 2026).
+- `snapped_to.sep_arcsec` is the separation of this request's click from the source; a kept spectrum is shared by every click that snaps to the same source (clarified on 14 Nov 2026).
 - `method.kind` is `"aperture"` or `"joint_psf"`.
 
 ### 7.2 Resolve
@@ -233,6 +238,9 @@ Base path `/api`. All responses are JSON except `frames.bin`.
 ```
 
 `track` is present only for sources moving faster than 50 mas/yr, includes parallax, and is computed by the server so there is a single implementation of propagation. `upstreams` values are `"ok"`, `"stale"` (cached copy served) or `"unavailable"`.
+
+- A CatWISE motion moves a marker only when it passes the server's checks (most fast CatWISE motions near bright stars are not real); a source that fails them has no `track` and stays at its catalogue position (clarified on 14 Nov 2026).
+- An object whose published astrometry the server holds (WISE 0855) keeps one CatWISE entry, its most significant, whose `track` comes from that published astrometry (parallax included), not from CatWISE's motion; its other CatWISE entries, the object listed again, are left out. Its `ra`, `dec`, `pmra`, `pmdec` and `epoch` stay CatWISE's own (clarified on 14 Nov 2026).
 
 ### 7.4 Status
 

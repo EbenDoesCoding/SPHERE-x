@@ -240,14 +240,8 @@ def test_unknown_fixture_and_unknown_key_answer_404(client):
 
 
 def test_endpoints_not_built_yet_say_so(client):
-    key = client.get("/api/fields", params={"fixture": "wise0855"}).json()["key"]
-    for url in (
-        f"/api/fields/{key}/spectrum?ra=1&dec=2",
-        f"/api/fields/{key}/overlays",
-        "/api/resolve?q=M31",
-    ):
-        body = assert_error(client.get(url), 404, "not_found")
-        assert "not built yet" in body["message"]
+    body = assert_error(client.get("/api/resolve?q=M31"), 404, "not_found")
+    assert "not built yet" in body["message"]
 
 
 @pytest.mark.parametrize(
@@ -389,7 +383,7 @@ def test_status_has_the_contract_shape_and_never_probes_when_told_not_to(client)
         "cache",
         "builds",
     }
-    assert status.status == "ok" and status.pipeline_version == "0.2.0"
+    assert status.status == "ok" and status.pipeline_version == "0.3.0"
     assert set(body["upstreams"]) == {"irsa_sia", "s3"}
     assert body["upstreams"]["s3"] == {"ok": False, "latency_ms": None, "checked_at": None}
     assert body["builds"] == {"active": 0, "queued": 0}
