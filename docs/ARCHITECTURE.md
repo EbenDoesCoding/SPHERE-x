@@ -85,6 +85,35 @@ Render's free disk resets on every deploy, so anything needed for the demo must 
 - Gaia lacks very bright and very faint objects (WISE 0855).
 - Never fabricate data. Fixtures must be labelled. `BAD_FLAG_MASK` and several thresholds in `spherex.py` are marked `UNVERIFIED` in the code.
 
+## Frontend (`web/`)
+
+Added by the frontend lane after `main` was merged into `frontend/main` on 14 November 2026. A guide for teammates is in `web/README.md`.
+
+```
+Static site (web/, Vite build, no server code)
+   ├── /        landing page   web/index.html      → web/src/landing/
+   └── /look/   comparator     web/look/index.html → web/src/main.tsx
+          ├── frames  → GET /api/fields on the frames engine (api/, docs/CONTRACT_FIELDS.md)
+          │             or the two recorded fields bundled in the site (/fixtures/<name>/)
+          └── search  → GET /resolve, GET /stars on this backend (docs/CONTRACT.md)
+```
+
+- **Pages.** One static site with two pages: the landing page at `/` and the comparator at `/look/`. The designed versions of both are being built tonight.
+- **Frames.** The comparator loads a field (a manifest and one float16 frame file, Contract v1.0) from the frames engine. When the engine does not answer, the two recorded fields (WISE 0855, Barnard's Star) load from the copies of `cache/fixtures/` that the build puts into the site.
+- **Endpoints of this backend it calls.** `/resolve` for names and coordinates, `/stars` for Gaia DR3 stars and proper motions (the hint for objects that have moved away from their catalogue position). Not used by the comparator today: `/frames`, `/overlay`, `/presets`.
+- **Configuration.** `VITE_TEAM_API_URL` is this backend's address; the browser calls it directly (CORS is open). `VITE_ENGINE_URL` is the engine's address; empty means the same origin, with `/api` proxied. Both are compiled into the page, so nothing secret goes there (`web/.env.example`). In development the Vite server proxies `/api` to `http://localhost:8080`, or to `TOMBAUGH_API_URL`.
+- **Design sources.** `docs/design/system/` (rules, tokens, components, hand-off guides), `docs/design/landing/` and `docs/design/comparator/` (layouts, states, behaviour, copy, and the removable parts).
+- **Why frames come from the engine** (the current wiring, still to be confirmed by the team: `CLAUDE.md` section 14). The designs and the viewer need every wavelength band of a visit on one brightness scale, with bad pixels masked and no-data pixels marked, and the engine is the only part that has produced all the test targets so far. This backend has what the engine lacks: name lookup, Gaia stars and a deployment.
+- **Deployment.** None. The static host is not chosen yet.
+
+## Frames engine (`api/`)
+
+A second FastAPI service (Python package `tombaugh`), separate from this backend. It finds SPHEREx exposures at IRSA, reads only the needed rows from the public bucket, masks bad pixels, registers north-up and stacks per visit and wavelength bin, and serves one float16 file per field from a disk cache. Not deployed; where it runs is still open (`CLAUDE.md` section 14).
+
+- Contract: `docs/CONTRACT_FIELDS.md` (Contract v1.0, machine-readable parts in `docs/contract/`).
+- History and known limits: `docs/ENGINE_NOTES.md`.
+- Run locally: `cd api && uv run uvicorn tombaugh.main:app --port 8080`.
+
 ## Change log
 
 Append two lines per task: what changed, where, any new constraint.
@@ -95,3 +124,6 @@ Append two lines per task: what changed, where, any new constraint.
 - 2026-11-14: `/frames` route, `/demo` and `/static` mounts, `/presets`, cache-first `/frames`. Constraint: presets need `demo_cache/` committed.
 - 2026-11-14: `/overlay`, live frames cache, sexagesimal input, live-build limit (503), live-folder cleanup. Constraint: overlay uses Gaia only.
 - 2026-11-14: Presets still not precomputed because IRSA TAP and SIA2 returned 502 or connection resets.
+- 2026-11-14: `main` merged into `frontend/main` with a foundation built on a separate local branch: frames engine `api/`, recorded fields `cache/fixtures/`, web app `web/`, prototypes `science/prototypes/`, `Dockerfile`, `fly.toml`, CI. The engine's contract and notes are `docs/CONTRACT_FIELDS.md` and `docs/ENGINE_NOTES.md` (renamed from `docs/contract.md` and `docs/architecture.md`, which clash with this folder's files on case-insensitive file systems). Constraint: two contracts; the merge changed no file of this backend.
+- 2026-11-14: Frontend: design sources in `docs/design/`; tokens, fonts and `bc-` component styles in `web/src/design/`; pages `/` and `/look/`; sections "Frontend (`web/`)" and "Frames engine (`api/`)" above. Constraint: the comparator calls `/resolve` and `/stars` here and takes frames from the engine; `/frames`, `/overlay` and `/presets` are not used by it today.
+- 2026-11-14: `CLAUDE.md`, `README.md`, `docs/RUNBOOK.md`, `docs/ENGINE_NOTES.md` and the new `web/README.md` describe the combined repository; CI runs on pull requests and on pushes to `main` only. Constraint: new change-log entries go here, not in `docs/ENGINE_NOTES.md`.

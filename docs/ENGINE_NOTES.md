@@ -1,7 +1,15 @@
-# Architecture log
+# Engine notes
 
-Team convention: two lines per task. The first says what changed and where; the second states any new
-constraint, or "none". Newest entries go at the bottom. The interface itself is in `docs/CONTRACT_FIELDS.md`.
+The history and known limits of the frames engine (`api/`) and of the parts built with it: the recorded
+fields, the first web viewer, CI and the container. The engine's interface is `docs/CONTRACT_FIELDS.md`. The
+team change log is `docs/ARCHITECTURE.md`: new entries go there. Update the list of known limits below when
+a limit changes.
+
+This file was `docs/architecture.md` until 14 November 2026; it was renamed because that name clashes with
+`docs/ARCHITECTURE.md` on case-insensitive file systems. The foundation was built on a local branch named
+`dev`, which no longer exists: it was merged with `main` into `frontend/main`. Each section below describes
+the state at its own time. Entries have two lines: what changed and where; then any new constraint, or
+"none".
 
 ## Foundation on `dev`, Saturday 14 November 2026
 
