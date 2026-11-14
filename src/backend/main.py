@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+from pathlib import Path
+from presets import DEMO_DIR, find_preset_frames, list_presets
+from fastapi.staticfiles import StaticFiles
+from spherex import SpherexError, build_frames
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -19,6 +23,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+DEMO_DIR.mkdir(exist_ok=True)
+app.mount("/demo", StaticFiles(directory=DEMO_DIR), name="demo")
+
+SPHEREX_STATUS = {"bad_request": 400, "no_coverage": 404, "upstream_error": 502}
+
+@app.exception_handler(SpherexError)
+async def spherex_error_handler(request: Request, exc: SpherexError):
+    status = SPHEREX_STATUS.get(exc.code, 500)
+    return JSONResponse(status_code=status, content={"error": str(exc)})
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"error": "Invalid or missing parameters"})
@@ -60,3 +76,37 @@ def stars_endpoint(ra: float, dec: float, size: float = 2.0):
     result = {"stars": stars}
     cache.save("stars", ra, dec, size, result)
     return result
+
+@app.get("/frames")
+def frames_endpoint(
+    ra: float,
+    dec: float,
+    size: float = 0.05,  # degrees
+    detector: int | None = None,
+    mode: str = "best",
+    group_id: int | None = None,
+):
+    # Presets were built with default options, so only use them for default requests
+    if detector is None and mode == "best" and group_id is None:
+        preset = find_preset_frames(ra, dec, size)
+        if preset is not None:
+            return preset
+
+    # Live path: one folder per unique request so users never overwrite each other's PNGs.
+    # image_url values are relative: the frontend must prepend the API base URL.
+    group = "auto" if group_id is None else group_id
+    folder = f"{ra:.4f}_{dec:.4f}_{size:.4f}_{detector or 'auto'}_{mode}_{group}"
+    return build_frames(
+        ra,
+        dec,
+        size,
+        detector,
+        STATIC_DIR / "frames" / folder,
+        f"/static/frames/{folder}",
+        mode=mode,
+        group_id=group_id,
+    )
+
+@app.get("/presets")
+def presets_endpoint():
+    return {"presets": list_presets()}
