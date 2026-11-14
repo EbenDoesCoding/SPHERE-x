@@ -334,3 +334,58 @@ describe("differenceFrame", () => {
     );
   });
 });
+
+describe("FieldSynth.stackFor (Then and now's SPHEREx side)", () => {
+  it("combines every SPHEREx plane of the preset over every visit, never a legacy plane", () => {
+    const stack = synthetic_field().synth.stackFor("d6", "uniform");
+    // Usable planes of bins 20 and 21 at time bins 0, 1, 2; the legacy plane (all 9) is left out.
+    expectPixels(stack.data, [7 / 5, 6 / 4, 5 / 3, 18 / 5]);
+    expect(stack.sigma).toBeCloseTo(Math.sqrt(0.01 + 0.04 + 0.01 + 0.01 + 0.09) / 5, 9);
+    expect(stack.nExposures).toBe(5 + 4 + 3 + 6 + 6);
+    expect(stack.timeBins).toEqual([0, 1, 2]);
+    expect(stack.waveBins).toEqual([20, 21]);
+    expect(stack.dateStart).toBe("2025-01-01");
+    expect(stack.dateEnd).toBe("2027-01-12");
+  });
+
+  it("has no data, and says so, when nothing lies in the preset", () => {
+    const stack = synthetic_field().synth.stackFor("d1");
+    expect(stack.nExposures).toBe(0);
+    expect(stack.timeBins).toEqual([]);
+    expect(stack.dateStart).toBeNull();
+    expectPixels(stack.data, [NAN, NAN, NAN, NAN]);
+    expect(() => synthetic_field().synth.stackFor("rgb")).toThrow(TypeError);
+  });
+});
+
+describe("FieldSynth.legacyPlanes", () => {
+  it("exposes the older survey's image apart from every SPHEREx frame", () => {
+    const { synth } = synthetic_field();
+    const legacy = synth.legacyPlanes();
+    expect(legacy.map((plane) => [plane.mission, plane.band])).toEqual([["AllWISE", "W2"]]);
+    expectPixels(synth.planeData(legacy[0]), [9, 9, 9, 9]);
+    // The legacy plane's 9s reach no frame of any preset.
+    for (const preset of ["all", "cold", "d6"]) {
+      for (const frame of synth.sequenceFor(preset)) {
+        expect(Array.from(frame.data).some((value) => value === 9)).toBe(false);
+      }
+    }
+  });
+
+  it("lists them in the order of presets.json legacy_pairs", () => {
+    const { manifest, synthetic_values } = synthetic_field();
+    const planes = manifest.planes.map((plane) =>
+      plane.kind === "legacy" ? { ...plane, band: "Ks", mission: "2MASS" } : plane,
+    );
+    const w1 = { ...manifest.planes[6], band: "W1", index: 7, offset: 6 * 8 };
+    const synth = new FieldSynth({ ...manifest, planes: [...planes, w1] }, synthetic_values);
+    expect(synth.legacyPlanes().map((plane) => plane.band)).toEqual(["W1", "Ks"]);
+  });
+
+  it("gives the wave bins of a preset on the field's own bins", () => {
+    const { synth } = synthetic_field();
+    expect(synth.presetBins("d6")).toEqual({ kind: "mono", bins: [20, 21, 22, 23] });
+    const rgb = synth.presetBins("rgb");
+    expect(rgb.kind === "rgb" && rgb.r).toEqual([16, 17, 18, 19, 20, 21, 22, 23]);
+  });
+});

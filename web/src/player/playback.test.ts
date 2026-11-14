@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ChangeGate,
   clampFps,
   DEFAULT_FPS,
   FPS_CHOICES,
@@ -207,5 +208,80 @@ describe("FrameClock", () => {
     unsubscribe();
     clock.show(2);
     expect(listener).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ChangeGate", () => {
+  let gate: ChangeGate;
+  /** Times (ms) at which a change was applied. */
+  let applied: number[];
+  const change =
+    (changes = true) =>
+    () => {
+      applied.push(Date.now());
+      return changes;
+    };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    gate = new ChangeGate(() => Date.now());
+    applied = [];
+  });
+
+  afterEach(() => {
+    gate.cancel();
+    vi.useRealTimers();
+  });
+
+  it("applies the first change at once and holds the next for a sixth of a second", () => {
+    gate.request(change());
+    gate.request(change());
+    expect(applied).toEqual([0]);
+    expect(gate.waiting).toBe(true);
+    vi.advanceTimersByTime(200);
+    expect(applied).toEqual([0, 167]);
+  });
+
+  it("lets a newer request replace one that is waiting", () => {
+    const order: string[] = [];
+    gate.request(() => {
+      order.push("down");
+      return true;
+    });
+    gate.request(() => {
+      order.push("up");
+      return true;
+    });
+    gate.request(() => {
+      order.push("down again");
+      return true;
+    });
+    vi.advanceTimersByTime(500);
+    expect(order).toEqual(["down", "down again"]);
+  });
+
+  it("stays open after a request that changed nothing", () => {
+    gate.request(change(false));
+    gate.request(change());
+    expect(applied).toEqual([0, 0]);
+  });
+
+  it("never lets more than 6 changes through in a second, however fast they are asked for", () => {
+    for (let t = 0; t < 3000; t += 10) {
+      gate.request(change());
+      vi.advanceTimersByTime(10);
+    }
+    const gaps = applied.slice(1).map((t, i) => t - applied[i]);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(166);
+    expect(applied.length).toBeLessThanOrEqual(19);
+  });
+
+  it("drops a waiting request on cancel", () => {
+    gate.request(change());
+    gate.request(change());
+    gate.cancel();
+    vi.advanceTimersByTime(1000);
+    expect(applied).toEqual([0]);
   });
 });

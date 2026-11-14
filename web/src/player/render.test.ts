@@ -5,15 +5,20 @@ import {
   DIVERGING_ZERO,
   differenceLimits,
   divergingColour,
+  isNoData,
   type Limits,
   NO_DATA_BASE,
   NO_DATA_STRIPE,
   paintDiverging,
   paintGrey,
+  paintRgb,
+  paintSigma,
   percentile,
   pooledLimits,
   renderDiverging,
   renderGrey,
+  type SigmaRamp,
+  sigmaColour,
   stretch,
   stretchSigned,
 } from "./render";
@@ -229,6 +234,169 @@ describe("difference map", () => {
     expect(pixelAt(rgba, 1)).toEqual([...DIVERGING_POSITIVE, 255]);
     expect(pixelAt(rgba, 2)).toEqual([...DIVERGING_NEGATIVE, 255]);
     expect(pixelAt(rgba, 3)).toEqual([...NO_DATA_BASE, 255]); // column 1, row 1
+  });
+});
+
+describe("invert", () => {
+  const limits: Limits = { sigmaRef: 1, vmin: -2, vmax: 10, soften: 3 };
+
+  it("reverses the ramp: white at vmin, black at vmax", () => {
+    const rgba = paintGrey(new Float32Array([-2, 10, 0, 0]), 2, limits, { invert: true });
+    expect(pixelAt(rgba, 0)).toEqual([255, 255, 255, 255]);
+    expect(pixelAt(rgba, 1)).toEqual([0, 0, 0, 255]);
+    expect(pixelAt(rgba, 2)).toEqual([192, 192, 192, 255]); // 255 - 63
+  });
+
+  it("never inverts the no-data hatch", () => {
+    const pixels = new Float32Array([NAN, 3, NAN, NAN, 1, NAN, NAN, NAN]);
+    const plain = paintGrey(pixels, 4, limits);
+    const inverted = paintGrey(pixels, 4, limits, { invert: true });
+    for (const p of [0, 2, 3, 5, 6, 7]) expect(pixelAt(inverted, p)).toEqual(pixelAt(plain, p));
+    expect(pixelAt(inverted, 1)).not.toEqual(pixelAt(plain, 1));
+  });
+
+  it("acts on every frame of a sequence alike", () => {
+    const first = synthetic_frame([0.3, 5, NAN, 1], 0.2);
+    const second = synthetic_frame([80, 0.3, 2, NAN], 0.6);
+    const shared = pooledLimits([first, second]);
+    const a = paintGrey(first.data, 2, shared, { invert: true });
+    const b = paintGrey(second.data, 2, shared, { invert: true });
+    expect(pixelAt(a, 0)).toEqual(pixelAt(b, 1));
+    expect(pixelAt(a, 0)[0]).toBe(255 - pixelAt(paintGrey(first.data, 2, shared), 0)[0]);
+  });
+
+  it("reaches the renderer", () => {
+    class ImageDataStandIn {
+      constructor(
+        readonly data: Uint8ClampedArray,
+        readonly width: number,
+        readonly height: number,
+      ) {}
+    }
+    vi.stubGlobal("ImageData", ImageDataStandIn);
+    const pixels = new Float32Array([-2, 10]);
+    const image = renderGrey(pixels, 2, 1, limits, { invert: true });
+    expect(Array.from(image.data)).toEqual(
+      Array.from(paintGrey(pixels, 2, limits, { invert: true })),
+    );
+  });
+});
+
+describe("three-colour", () => {
+  // Each channel has its own scale; a level depends on its own channel only.
+  const red: Limits = { sigmaRef: 1, vmin: -2, vmax: 10, soften: 3 };
+  const green: Limits = { sigmaRef: 0.1, vmin: -0.2, vmax: 1, soften: 0.3 };
+  const blue: Limits = { sigmaRef: 10, vmin: -20, vmax: 100, soften: 30 };
+  const limits = { r: red, g: green, b: blue };
+
+  it("stretches each channel with its own limits", () => {
+    const rgba = paintRgb(
+      new Float32Array([10, -2, 0]),
+      new Float32Array([-0.2, 1, 0]),
+      new Float32Array([100, -20, 0]),
+      3,
+      limits,
+    );
+    expect(pixelAt(rgba, 0)).toEqual([255, 0, 255, 255]);
+    expect(pixelAt(rgba, 1)).toEqual([0, 255, 0, 255]);
+    // zero sits at the same place on every channel's scale here (each is vmin = -2σ, soften 3σ)
+    expect(pixelAt(rgba, 2)).toEqual([63, 63, 63, 255]);
+  });
+
+  it("hatches a pixel that lacks a value in any channel, never drawing it as zero", () => {
+    const rgba = paintRgb(
+      new Float32Array([NAN, 1, 1, 1]),
+      new Float32Array([0.5, NAN, 0.5, 0.5]),
+      new Float32Array([5, 5, Number.POSITIVE_INFINITY, 5]),
+      2,
+      limits,
+    );
+    expect(pixelAt(rgba, 0)).toEqual([...NO_DATA_STRIPE, 255]);
+    expect(pixelAt(rgba, 1)).toEqual([...NO_DATA_BASE, 255]);
+    expect(pixelAt(rgba, 2)).toEqual([...NO_DATA_BASE, 255]);
+    expect(pixelAt(rgba, 3)[3]).toBe(255);
+    expect(pixelAt(rgba, 3).slice(0, 3)).not.toEqual([...NO_DATA_BASE]);
+  });
+
+  it("hatches everything when a channel has no limits", () => {
+    const rgba = paintRgb(new Float32Array([1]), new Float32Array([1]), new Float32Array([1]), 1, {
+      ...limits,
+      g: null,
+    });
+    expect(pixelAt(rgba, 0)).toEqual([...NO_DATA_STRIPE, 255]);
+  });
+
+  it("inverts every channel, never the hatch", () => {
+    const r = new Float32Array([10, NAN]);
+    const g = new Float32Array([-0.2, 0]);
+    const b = new Float32Array([0, 0]);
+    const plain = paintRgb(r, g, b, 2, limits);
+    const inverted = paintRgb(r, g, b, 2, limits, { invert: true });
+    expect(pixelAt(inverted, 0)).toEqual([0, 255, 255 - pixelAt(plain, 0)[2], 255]);
+    expect(pixelAt(inverted, 1)).toEqual(pixelAt(plain, 1));
+  });
+
+  it("refuses channels on different grids", () => {
+    expect(() =>
+      paintRgb(new Float32Array(4), new Float32Array(4), new Float32Array(3), 2, limits),
+    ).toThrow(RangeError);
+  });
+});
+
+describe("difference in units of noise", () => {
+  // A stand-in ramp with easy numbers; the comparator reads the real one from the diff-* tokens.
+  const ramp: SigmaRamp = {
+    zero: [10, 10, 10],
+    earlier: [
+      [20, 10, 10],
+      [30, 10, 10],
+      [40, 10, 10],
+      [50, 10, 10],
+      [60, 10, 10],
+    ],
+    later: [
+      [10, 10, 20],
+      [10, 10, 30],
+      [10, 10, 40],
+      [10, 10, 50],
+      [10, 10, 60],
+    ],
+  };
+
+  it("is neutral at zero, brighter earlier below it and brighter later above it", () => {
+    expect(sigmaColour(0, ramp)).toEqual([10, 10, 10]);
+    expect(sigmaColour(-1, ramp)).toEqual([20, 10, 10]);
+    expect(sigmaColour(1, ramp)).toEqual([10, 10, 20]);
+    expect(sigmaColour(-5, ramp)).toEqual([60, 10, 10]);
+    expect(sigmaColour(5, ramp)).toEqual([10, 10, 60]);
+  });
+
+  it("interpolates between whole steps and clips at five sigma", () => {
+    expect(sigmaColour(0.5, ramp)).toEqual([10, 10, 15]);
+    expect(sigmaColour(-2.25, ramp)).toEqual([33, 10, 10]); // 30 + 10 * 0.25 = 32.5
+    expect(sigmaColour(-40, ramp)).toEqual([60, 10, 10]);
+    expect(sigmaColour(99, ramp)).toEqual([10, 10, 60]);
+  });
+
+  it("divides each pixel by the noise of the difference", () => {
+    const rgba = paintSigma(new Float32Array([0, 0.2, -0.6, NAN]), 2, 0.2, ramp);
+    expect(pixelAt(rgba, 0)).toEqual([10, 10, 10, 255]);
+    expect(pixelAt(rgba, 1)).toEqual([10, 10, 20, 255]); // +1σ
+    expect(pixelAt(rgba, 2)).toEqual([40, 10, 10, 255]); // −3σ
+    expect(pixelAt(rgba, 3)).toEqual([...NO_DATA_BASE, 255]);
+  });
+
+  it("hatches everything when the noise is unknown", () => {
+    for (const sigma of [NAN, 0, -1]) {
+      const rgba = paintSigma(new Float32Array([0.1]), 1, sigma, ramp);
+      expect(pixelAt(rgba, 0)).toEqual([...NO_DATA_STRIPE, 255]);
+    }
+  });
+
+  it("calls NaN and infinities no data", () => {
+    expect(isNoData(NAN)).toBe(true);
+    expect(isNoData(Number.NEGATIVE_INFINITY)).toBe(true);
+    expect(isNoData(0)).toBe(false);
   });
 });
 

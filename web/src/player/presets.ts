@@ -67,6 +67,14 @@ export const PRESETS_FILE = presetsJson as PresetsFile;
 export const PRESETS: readonly Preset[] = PRESETS_FILE.presets;
 export const DEFAULT_WEIGHTING: Weighting = PRESETS_FILE.weighting.default;
 
+/** The older-survey bands, in the order of presets.json `legacy_pairs` (W1, W2, J, H, Ks). */
+export const LEGACY_PAIRS: readonly LegacyPair[] = PRESETS_FILE.legacy_pairs;
+
+/** The `legacy_pairs` entry of an older-survey band ("W1", "W2", "J", "H", "Ks"), or null. */
+export function legacyPair(band: string | null): LegacyPair | null {
+  return LEGACY_PAIRS.find((pair) => pair.band === band) ?? null;
+}
+
 /** The preset with this id; throws for an id presets.json does not define. */
 export function getPreset(presetId: string): Preset {
   const preset = PRESETS.find((candidate) => candidate.id === presetId);

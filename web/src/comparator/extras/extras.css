@@ -1,0 +1,21 @@
+/* ==========================================================================
+   The extras lane: the spectrum panel (blocks/SpectrumPanel.tsx). Tokens and bc- classes only.
+   The table scrolls inside the panel (Handoff-behaviour): 250 px at 1280 and 1440, 300 px on a
+   phone, as on the boards (Main.dc.html, Phone.dc.html).
+   ========================================================================== */
+
+.cmp-sp-table {
+  max-height: calc(var(--space-1) * 75);
+  overflow-y: auto;
+}
+
+.cmp--three .cmp-sp-table,
+.cmp--wide .cmp-sp-table {
+  max-height: calc(var(--space-1) * 62.5);
+}
+
+/* The chart keeps the size it was laid out for: the SVG is drawn at the measured width. */
+.cmp-sp .bc-chart {
+  max-width: 100%;
+  height: auto;
+}

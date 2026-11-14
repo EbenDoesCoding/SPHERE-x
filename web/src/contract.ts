@@ -377,6 +377,11 @@ export interface CatwiseSource {
   w1: number | null;
   /** W2 magnitude. */
   w2: number | null;
+  /**
+   * Section 7.3: "track is present only for sources moving faster than 50 mas/yr". The example
+   * shows it on a Gaia source; the engine also sends it for CatWISE sources whose motion it trusts.
+   */
+  track?: TrackPoint[];
 }
 
 /** `GET /api/fields/{key}/overlays`. */

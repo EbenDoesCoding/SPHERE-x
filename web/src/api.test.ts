@@ -2,12 +2,20 @@ import { describe, expect, it } from "vitest";
 import {
   checkFrames,
   checkRequest,
+  engineUrl,
   FieldError,
   type FieldErrorCode,
   type FieldRequest,
   fieldUrl,
+  isEngineOrigin,
   type LoadProgress,
+  loadBundledField,
   loadField,
+  loadOverlays,
+  loadSpectrum,
+  loadStatus,
+  type MeasureProgress,
+  spectrumUrl,
 } from "./api";
 import type { Manifest } from "./contract";
 
@@ -133,6 +141,8 @@ function harness(handler: Handler) {
   };
   const options = {
     fetchImpl,
+    // The page and the engine share one origin unless a test says otherwise.
+    engine: "",
     sleep: async (ms: number) => {
       sleeps.push(ms);
     },
@@ -480,5 +490,278 @@ describe("checkFrames", () => {
       frames: { url: "", dtype: "float16", byteorder: "little", nbytes: 16, sha256: "" },
     };
     expect(() => checkFrames(inconsistent, new ArrayBuffer(16))).toThrow(/1 planes of 2 x 2/);
+  });
+});
+
+describe("the engine's address", () => {
+  it("keeps /api paths on the page's own origin by default", () => {
+    expect(engineUrl("/api/fields?fixture=wise0855", "")).toBe("/api/fields?fixture=wise0855");
+  });
+
+  it("puts /api paths on VITE_ENGINE_URL when it is set", () => {
+    expect(engineUrl("/api/status", "https://engine.example")).toBe(
+      "https://engine.example/api/status",
+    );
+    expect(engineUrl("/api/status", "https://engine.example/")).toBe(
+      "https://engine.example/api/status",
+    );
+  });
+
+  it("leaves full URLs and other paths as they are", () => {
+    expect(engineUrl("https://other.example/x", "https://engine.example")).toBe(
+      "https://other.example/x",
+    );
+    expect(engineUrl("//cdn.example/x", "https://engine.example")).toBe("//cdn.example/x");
+    expect(engineUrl("fixtures/a.json", "https://engine.example")).toBe("fixtures/a.json");
+  });
+
+  it("loads the manifest and the frame file from the engine, the bundled copy from the page", async () => {
+    const { urls, options } = harness((url) =>
+      url.endsWith("frames.bin") ? binary(synthetic_frames()) : json(synthetic_manifest),
+    );
+    await loadField({ ra: 10, dec: 20, fov: 6 }, { ...options, engine: "https://engine.example" });
+    expect(urls).toEqual([
+      "https://engine.example/api/fields?ra=10&dec=20&fov=6",
+      "https://engine.example/api/fields/0123456789abcdef/frames.bin",
+    ]);
+
+    const offlineEngine = harness((url) => {
+      if (url.startsWith("https://engine.example/")) throw new TypeError("fetch failed");
+      return url.endsWith("manifest.json") ? json(synthetic_manifest) : binary(synthetic_frames());
+    });
+    const field = await loadField(
+      { fixture: "wise0855" },
+      { ...offlineEngine.options, engine: "https://engine.example" },
+    );
+    expect(field.source).toBe("bundled");
+    expect(offlineEngine.urls.slice(3)).toEqual([
+      "/fixtures/wise0855/manifest.json",
+      "/fixtures/wise0855/frames.bin",
+    ]);
+  });
+});
+
+describe("loadStatus", () => {
+  const status = {
+    contract: "1.0",
+    status: "ok",
+    pipeline_version: "0.2.0",
+    newest_exposure: { mjd: 61318.0, date: "2026-10-05" },
+    upstreams: {},
+    cache: { used_mb: 1, free_mb: 2 },
+    builds: { active: 0, queued: 0 },
+  };
+
+  it("returns the engine's status", async () => {
+    const { urls, options } = harness(() => json(status));
+    const answer = await loadStatus(options);
+    expect(answer?.newest_exposure.date).toBe("2026-10-05");
+    expect(urls).toEqual(["/api/status"]);
+  });
+
+  it("asks the configured engine", async () => {
+    const { urls, options } = harness(() => json(status));
+    await loadStatus({ ...options, engine: "https://engine.example" });
+    expect(urls).toEqual(["https://engine.example/api/status"]);
+  });
+
+  it.each<[string, Handler]>([
+    ["nothing answers", offline],
+    ["a static host's HTML page", () => html(200)],
+    ["a 404 page", () => html(404)],
+    ["the site's own proxy", () => proxyError("origin_unreachable")],
+    ["an error from the API", () => apiError(500, "internal", "broken")],
+  ])("resolves to null when %s, after one attempt", async (_what, handler) => {
+    const { urls, options } = harness(handler);
+    expect(await loadStatus(options)).toBeNull();
+    expect(urls).toHaveLength(1);
+  });
+
+  it("rejects when aborted", async () => {
+    const controller = new AbortController();
+    const { options } = harness(() => {
+      controller.abort();
+      throw new DOMException("The operation was aborted.", "AbortError");
+    });
+    await expect(loadStatus({ ...options, signal: controller.signal })).rejects.toMatchObject({
+      name: "AbortError",
+    });
+  });
+});
+
+describe("loadBundledField", () => {
+  it("takes the bundled copy without asking the engine", async () => {
+    const { urls, options } = harness((url) =>
+      url.endsWith("manifest.json") ? json(synthetic_manifest) : binary(synthetic_frames()),
+    );
+    const field = await loadBundledField("wise0855", options);
+    expect(field.source).toBe("bundled");
+    expect(urls).toEqual(["/fixtures/wise0855/manifest.json", "/fixtures/wise0855/frames.bin"]);
+  });
+
+  it("says so when the recorded field is not bundled", async () => {
+    const { options } = harness(() => html(404));
+    const error = await failure(loadBundledField("barnard", options));
+    expect(error.code).toBe("fixture_missing");
+  });
+
+  it("refuses a name that is not a recorded field's", async () => {
+    const { urls, options } = harness(offline);
+    const error = await failure(loadBundledField("../x", options));
+    expect(error.code).toBe("bad_request");
+    expect(urls).toEqual([]);
+  });
+});
+
+/** The harness's options without its build-progress callback (the extras report their own). */
+const quiet = ({ onProgress: _progress, ...rest }: ReturnType<typeof harness>["options"]) => rest;
+
+// The shapes of sections 7.1 and 7.3, with no sources and no points: only statuses matter here.
+const synthetic_overlays = {
+  contract: "1.0",
+  status: "ok",
+  gaia: [],
+  catwise: [],
+  upstreams: { gaia: "ok", catwise: "stale" },
+};
+
+const synthetic_spectrum = {
+  contract: "1.0",
+  status: "ok",
+  state: "no_data",
+  target: { ra: 10, dec: 20 },
+  neighbours: [],
+  method: {
+    kind: "aperture",
+    radius_px: 2,
+    encircled_energy: 0.9,
+    annulus_px: [5, 9],
+    systematic_floor: 0.03,
+  },
+  time_span: null,
+  points: [],
+  binned: [],
+};
+
+describe("loadOverlays", () => {
+  it("asks the engine for the field's catalogue sources", async () => {
+    const { urls, options } = harness(() => json(synthetic_overlays));
+    const answer = await loadOverlays("0123456789abcdef", {
+      ...quiet(options),
+      engine: "https://e.x",
+    });
+    expect(urls).toEqual(["https://e.x/api/fields/0123456789abcdef/overlays"]);
+    expect(answer.upstreams).toEqual({ gaia: "ok", catwise: "stale" });
+  });
+
+  it("polls while the engine answers 202", async () => {
+    const { urls, options } = harness((_url, call) =>
+      call === 1 ? building("discover", 0, 1) : json(synthetic_overlays),
+    );
+    await loadOverlays("0123456789abcdef", quiet(options));
+    expect(urls).toHaveLength(2);
+  });
+
+  it("carries the engine's code and sentence when the route is missing", async () => {
+    const { options } = harness(() =>
+      apiError(404, "not_found", "The overlays endpoint is not built yet."),
+    );
+    const error = await failure(loadOverlays("0123456789abcdef", quiet(options)));
+    expect(error.code).toBe("not_found");
+    expect(error.message).toBe("The overlays endpoint is not built yet.");
+  });
+
+  it("says the engine is unreachable when nothing that speaks the contract answers", async () => {
+    const { options } = harness(() => html(502));
+    expect((await failure(loadOverlays("0123456789abcdef", quiet(options)))).code).toBe(
+      "unreachable",
+    );
+    const offlineRun = harness(offline);
+    const error = await failure(loadOverlays("0123456789abcdef", quiet(offlineRun.options)));
+    expect(error.code).toBe("unreachable");
+  });
+
+  it("refuses an answer of another shape, and a key that is not a key", async () => {
+    const { options } = harness(() => json({ contract: "1.0", status: "ok", gaia: [] }));
+    expect((await failure(loadOverlays("0123456789abcdef", quiet(options)))).code).toBe(
+      "bad_response",
+    );
+    const { urls, options: none } = harness(() => json(synthetic_overlays));
+    expect((await failure(loadOverlays("../status", quiet(none)))).code).toBe("bad_request");
+    expect(urls).toEqual([]);
+  });
+});
+
+describe("loadSpectrum", () => {
+  it("asks for the position inside the field", async () => {
+    expect(spectrumUrl("abc", 133.75977, -7.2418)).toBe(
+      "/api/fields/abc/spectrum?ra=133.75977&dec=-7.2418",
+    );
+    const { urls, options } = harness(() => json(synthetic_spectrum));
+    const answer = await loadSpectrum("abc", 133.75977, -7.2418, quiet(options));
+    expect(urls).toEqual(["/api/fields/abc/spectrum?ra=133.75977&dec=-7.2418"]);
+    expect(answer.state).toBe("no_data");
+  });
+
+  it("reports how far a measurement got while the engine answers 202", async () => {
+    const steps: MeasureProgress[] = [];
+    const { options } = harness((_url, call) =>
+      call === 1 ? building("fetch", 120, 258) : json(synthetic_spectrum),
+    );
+    await loadSpectrum("abc", 1, 2, { ...quiet(options), onProgress: (step) => steps.push(step) });
+    expect(steps).toEqual([{ done: 120, total: 258 }]);
+  });
+
+  it("refuses a state the contract does not name, and a position off the sky", async () => {
+    const { options } = harness(() => json({ ...synthetic_spectrum, state: "great" }));
+    expect((await failure(loadSpectrum("abc", 1, 2, quiet(options)))).code).toBe("bad_response");
+    expect((await failure(loadSpectrum("abc", 361, 2, quiet(options)))).code).toBe("bad_request");
+  });
+
+  it("passes the engine's X-Tombaugh-Incomplete header on with the answer", async () => {
+    const { options } = harness(() =>
+      json(synthetic_spectrum, 200, {
+        "X-Tombaugh-Incomplete": "12 of 258 exposures not measured; not cached",
+      }),
+    );
+    const answer = await loadSpectrum("abc", 1, 2, quiet(options));
+    expect(answer.incomplete).toBe("12 of 258 exposures not measured; not cached");
+    const whole = await loadSpectrum(
+      "abc",
+      1,
+      2,
+      quiet(harness(() => json(synthetic_spectrum)).options),
+    );
+    expect(whole.incomplete).toBeUndefined();
+  });
+});
+
+describe("where a frame file may come from", () => {
+  it("allows the page's own origin and the configured engine, nothing else", () => {
+    const page = "https://tombaugh.example/look/?target=wise0855";
+    expect(isEngineOrigin("/api/fields/k/frames.bin?v=1", "", page)).toBe(true);
+    expect(isEngineOrigin("frames.bin", "", page)).toBe(true);
+    expect(isEngineOrigin("https://tombaugh.example/api/x", "", page)).toBe(true);
+    expect(isEngineOrigin("https://engine.example/api/x", "https://engine.example", page)).toBe(
+      true,
+    );
+    expect(isEngineOrigin("https://other.example/x", "https://engine.example", page)).toBe(false);
+    expect(isEngineOrigin("//cdn.example/x", "https://engine.example", page)).toBe(false);
+    expect(isEngineOrigin("https://other.example/x", "", null)).toBe(false);
+  });
+
+  it("refuses a manifest whose frame file is on another site, before fetching it", async () => {
+    const { frames } = synthetic_manifest;
+    if (!frames) throw new Error("the synthetic manifest has a frame file");
+    const manifest: Manifest = {
+      ...synthetic_manifest,
+      frames: { ...frames, url: "https://other.example/frames.bin" },
+    };
+    const { urls, options } = harness(() => json(manifest));
+    const error = await failure(
+      loadField({ ra: 10, dec: 20, fov: 6 }, { ...options, engine: "https://engine.example" }),
+    );
+    expect(error.code).toBe("bad_response");
+    expect(urls).toEqual(["https://engine.example/api/fields?ra=10&dec=20&fov=6"]);
   });
 });

@@ -11,6 +11,10 @@
  *
  * NaN means no data. It is drawn as a muted hatch that is not on either colour scale, never as
  * zero and never as black.
+ *
+ * Contrast acts through the limits (the comparator's displayLimits narrows vmax), so it reaches
+ * every frame drawn with them. Invert reverses the ramp for every frame alike and never touches the
+ * hatch. Three-colour frames stretch each channel on its own limits, shared by the sequence.
  */
 
 /** Scale shared by every frame of a sequence. All values in MJy/sr. */
@@ -31,8 +35,17 @@ export interface Scalable {
   sigma: number;
 }
 
-type Rgb = readonly [number, number, number];
+export type Rgb = readonly [number, number, number];
 type Rgba = Uint8ClampedArray<ArrayBuffer>;
+
+/** How a frame is drawn besides its limits. */
+export interface PaintOptions {
+  /** The ramp reversed: white at vmin, black at vmax. The no-data hatch is never inverted. */
+  invert?: boolean;
+}
+
+/** A pixel with no value: NaN or an infinity. Drawn hatched by every painter here. */
+export const isNoData = (value: number): boolean => !Number.isFinite(value);
 
 /** No data: a dark plum hatch, off the grey ramp and off both arms of the difference map. */
 export const NO_DATA_BASE: Rgb = [44, 32, 48];
@@ -162,9 +175,16 @@ function paintNoData(rgba: Rgba, pixel: number, nx: number): void {
 
 /**
  * RGBA bytes of a frame on the grey scale: black at vmin, white at vmax, hatch where NaN.
+ * With `invert` the ramp is reversed (white at vmin); the hatch stays as it is.
  * @param nx width of the frame in pixels (rows are data.length / nx)
  */
-export function paintGrey(data: Float32Array, nx: number, limits: Limits | null): Rgba {
+export function paintGrey(
+  data: Float32Array,
+  nx: number,
+  limits: Limits | null,
+  options: PaintOptions = {},
+): Rgba {
+  const invert = options.invert === true;
   const rgba = new Uint8ClampedArray(data.length * 4);
   for (let p = 0; p < data.length; p++) {
     const value = data[p];
@@ -172,10 +192,113 @@ export function paintGrey(data: Float32Array, nx: number, limits: Limits | null)
       paintNoData(rgba, p, nx);
       continue;
     }
-    const level = Math.round(255 * stretch(value, limits));
+    const stretched = Math.round(255 * stretch(value, limits));
+    const level = invert ? 255 - stretched : stretched;
     rgba[p * 4] = level;
     rgba[p * 4 + 1] = level;
     rgba[p * 4 + 2] = level;
+    rgba[p * 4 + 3] = 255;
+  }
+  return rgba;
+}
+
+/** One scale per channel of a three-colour sequence, each shared by every frame. */
+export interface RgbLimits {
+  r: Limits | null;
+  g: Limits | null;
+  b: Limits | null;
+}
+
+/**
+ * RGBA bytes of a three-colour frame: red, green and blue each on the asinh scale of its own
+ * channel's limits. A pixel that lacks a value in ANY channel, or whose channel has no limits, is
+ * hatched: a missing channel is never drawn as zero. With `invert` every channel is reversed.
+ */
+export function paintRgb(
+  r: Float32Array,
+  g: Float32Array,
+  b: Float32Array,
+  nx: number,
+  limits: RgbLimits,
+  options: PaintOptions = {},
+): Rgba {
+  if (g.length !== r.length || b.length !== r.length) {
+    throw new RangeError("the three channels are on different grids");
+  }
+  const invert = options.invert === true;
+  const rgba = new Uint8ClampedArray(r.length * 4);
+  const level = (value: number, channel: Limits) => {
+    const stretched = Math.round(255 * stretch(value, channel));
+    return invert ? 255 - stretched : stretched;
+  };
+  for (let p = 0; p < r.length; p++) {
+    const red = r[p];
+    const green = g[p];
+    const blue = b[p];
+    if (
+      limits.r === null ||
+      limits.g === null ||
+      limits.b === null ||
+      !Number.isFinite(red) ||
+      !Number.isFinite(green) ||
+      !Number.isFinite(blue)
+    ) {
+      paintNoData(rgba, p, nx);
+      continue;
+    }
+    rgba[p * 4] = level(red, limits.r);
+    rgba[p * 4 + 1] = level(green, limits.g);
+    rgba[p * 4 + 2] = level(blue, limits.b);
+    rgba[p * 4 + 3] = 255;
+  }
+  return rgba;
+}
+
+/**
+ * The difference scale in units of noise (the design system's diff-* tokens): five steps on each
+ * side of a dark neutral. `earlier[0]` is the 1σ step of "brighter earlier", `earlier[4]` 5σ.
+ */
+export interface SigmaRamp {
+  earlier: readonly Rgb[];
+  zero: Rgb;
+  later: readonly Rgb[];
+}
+
+/**
+ * Colour of a difference of `s` noise units (later minus earlier): linear between the whole
+ * steps of the ramp, clipped at ±5σ (bundle.js diffColor). Negative is brighter earlier.
+ */
+export function sigmaColour(s: number, ramp: SigmaRamp): [number, number, number] {
+  const clipped = Math.max(-5, Math.min(5, s));
+  const side = clipped < 0 ? ramp.earlier : ramp.later;
+  const magnitude = Math.abs(clipped);
+  const low = Math.floor(magnitude);
+  const high = Math.min(5, low + 1);
+  const f = magnitude - low;
+  const c0 = low === 0 ? ramp.zero : side[low - 1];
+  const c1 = high === 0 ? ramp.zero : side[high - 1];
+  return [
+    Math.round(c0[0] + (c1[0] - c0[0]) * f),
+    Math.round(c0[1] + (c1[1] - c0[1]) * f),
+    Math.round(c0[2] + (c1[2] - c0[2]) * f),
+  ];
+}
+
+/**
+ * RGBA bytes of a difference (later minus earlier, MJy/sr) on the σ scale: each pixel is
+ * value / sigma noise units. Hatch where a pixel has no value, and everywhere when the noise is
+ * unknown (the difference cannot then be put in units of noise).
+ */
+export function paintSigma(data: Float32Array, nx: number, sigma: number, ramp: SigmaRamp): Rgba {
+  const usable = Number.isFinite(sigma) && sigma > 0;
+  const rgba = new Uint8ClampedArray(data.length * 4);
+  for (let p = 0; p < data.length; p++) {
+    const value = data[p];
+    if (!usable || !Number.isFinite(value)) {
+      paintNoData(rgba, p, nx);
+      continue;
+    }
+    rgba.set(sigmaColour(value / sigma, ramp), p * 4);
     rgba[p * 4 + 3] = 255;
   }
   return rgba;
@@ -202,8 +325,9 @@ export function renderGrey(
   nx: number,
   ny: number,
   limits: Limits | null,
+  options: PaintOptions = {},
 ): ImageData {
-  return new ImageData(paintGrey(data, nx, limits), nx, ny);
+  return new ImageData(paintGrey(data, nx, limits, options), nx, ny);
 }
 
 /** A difference frame as an ImageData at data resolution (nx by ny), blue/orange scale. */

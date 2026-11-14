@@ -38,6 +38,51 @@ export function waitBeforeChange(nowMs: number, lastChangeMs: number): number {
   return Math.max(0, lastChangeMs + MIN_CHANGE_INTERVAL_MS - nowMs);
 }
 
+type Timer = ReturnType<typeof setTimeout>;
+
+/**
+ * The one rate limit on picture changes: whatever asks for a change (a timer, a held arrow key,
+ * the flip key, fast clicking), the picture changes at most 6 times per second.
+ *
+ * `request(apply)` runs `apply` at once when a change is allowed, else at the first allowed
+ * moment. A newer request replaces one that is still waiting, so a held key changes the picture
+ * once per slot. `apply` returns true when it really changed the picture; only then does the gate
+ * close for 1/6 s.
+ */
+export class ChangeGate {
+  private lastChangeMs = Number.NEGATIVE_INFINITY;
+  private pending: Timer | null = null;
+
+  /** @param now clock in ms; injectable so tests can drive time */
+  constructor(private readonly now: () => number = () => performance.now()) {}
+
+  request(apply: () => boolean): void {
+    this.cancel();
+    const wait = waitBeforeChange(this.now(), this.lastChangeMs);
+    if (wait <= 0) {
+      if (apply()) this.lastChangeMs = this.now();
+      return;
+    }
+    // Timers take whole milliseconds and may fire a little early, so the limit is checked
+    // again when this one fires.
+    this.pending = setTimeout(() => {
+      this.pending = null;
+      this.request(apply);
+    }, Math.ceil(wait));
+  }
+
+  /** True while a request waits for its slot. */
+  get waiting(): boolean {
+    return this.pending !== null;
+  }
+
+  /** Drops a request that is still waiting. */
+  cancel(): void {
+    if (this.pending !== null) clearTimeout(this.pending);
+    this.pending = null;
+  }
+}
+
 export interface ClockState {
   /** Index of the frame shown, 0-based. */
   index: number;
@@ -48,17 +93,16 @@ export interface ClockState {
   fps: number;
 }
 
-type Timer = ReturnType<typeof setTimeout>;
-
 export class FrameClock {
   private state: ClockState = { index: 0, count: 0, playing: false, fps: DEFAULT_FPS };
   private readonly listeners = new Set<() => void>();
-  private lastChangeMs = Number.NEGATIVE_INFINITY;
-  private pending: Timer | null = null;
+  private readonly gate: ChangeGate;
   private ticker: Timer | null = null;
 
   /** @param now clock in ms; injectable so tests can drive time */
-  constructor(private readonly now: () => number = () => performance.now()) {}
+  constructor(now: () => number = () => performance.now()) {
+    this.gate = new ChangeGate(now);
+  }
 
   /** Calls `listener` after every state change; returns the function that stops it. */
   subscribe = (listener: () => void): (() => void) => {
@@ -123,23 +167,15 @@ export class FrameClock {
    * A newer request replaces one that is still waiting, so a held key steps once per slot.
    */
   private requestChange(target: (index: number) => number): void {
-    if (this.pending !== null) clearTimeout(this.pending);
-    this.pending = null;
-    const wait = waitBeforeChange(this.now(), this.lastChangeMs);
-    if (wait <= 0) {
-      this.applyChange(target);
-      return;
-    }
-    // Timers take whole milliseconds and may fire a little early, so the limit is checked
-    // again when this one fires.
-    this.pending = setTimeout(() => this.requestChange(target), Math.ceil(wait));
+    this.gate.request(() => this.applyChange(target));
   }
 
-  private applyChange(target: (index: number) => number): void {
+  /** Applies a change; false when it would not change the picture. */
+  private applyChange(target: (index: number) => number): boolean {
     const next = target(this.state.index);
-    if (next === this.state.index || next < 0 || next >= this.state.count) return;
-    this.lastChangeMs = this.now();
+    if (next === this.state.index || next < 0 || next >= this.state.count) return false;
     this.update({ index: next });
+    return true;
   }
 
   private startTicker(): void {
@@ -151,9 +187,8 @@ export class FrameClock {
 
   private stopTimers(): void {
     if (this.ticker !== null) clearInterval(this.ticker);
-    if (this.pending !== null) clearTimeout(this.pending);
+    this.gate.cancel();
     this.ticker = null;
-    this.pending = null;
   }
 
   private update(patch: Partial<ClockState>): void {

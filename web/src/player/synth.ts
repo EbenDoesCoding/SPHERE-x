@@ -16,6 +16,7 @@ import {
   contractWaveBins,
   DEFAULT_WEIGHTING,
   getPreset,
+  LEGACY_PAIRS,
   type Weighting,
 } from "./presets";
 
@@ -54,6 +55,79 @@ export interface RgbFrame {
   r: Frame;
   g: Frame;
   b: Frame;
+}
+
+/**
+ * One stack of a set of wave bins over EVERY time bin (Then and now's SPHEREx side): the frame
+ * formula of section 4 taken over all (time bin, wave bin) planes of the selection.
+ */
+export interface Stack {
+  /** ny * nx pixels, MJy/sr. NaN = no data. */
+  data: Float32Array;
+  /** Noise propagated from the planes, MJy/sr. NaN when nothing contributes. */
+  sigma: number;
+  nExposures: number;
+  lamMin: number;
+  lamMax: number;
+  /** Contributing wave bins, ascending. */
+  waveBins: number[];
+  /** Contributing time bins, ascending. */
+  timeBins: number[];
+  /** ISO dates of the earliest and latest contributing planes; null when nothing contributes. */
+  dateStart: string | null;
+  dateEnd: string | null;
+}
+
+/** An older survey's image (a "legacy" plane, contract section 5). Never part of a SPHEREx frame. */
+export type LegacyPlane = Plane & { kind: "legacy"; band: string };
+
+function isLegacy(plane: Plane): plane is LegacyPlane {
+  return plane.kind === "legacy" && typeof plane.band === "string";
+}
+
+/** Weighted mean of planes per pixel (finite pixels only), with the noise and the facts of the mix. */
+function combine(
+  planes: readonly SciencePlane[],
+  npix: number,
+  pixelsOf: (plane: SciencePlane) => Float32Array,
+  weighting: Weighting,
+) {
+  const weighted = new Float64Array(npix);
+  const weightAt = new Float64Array(npix);
+  let weightTotal = 0;
+  let varianceTotal = 0;
+  for (const plane of planes) {
+    const w = weighting === "ivar" ? 1 / (plane.sigma * plane.sigma) : 1;
+    const pixels = pixelsOf(plane);
+    for (let p = 0; p < npix; p++) {
+      const value = pixels[p];
+      if (Number.isFinite(value)) {
+        weighted[p] += w * value;
+        weightAt[p] += w;
+      }
+    }
+    weightTotal += w;
+    varianceTotal += w * w * plane.sigma * plane.sigma;
+  }
+  const data = new Float32Array(npix);
+  for (let p = 0; p < npix; p++) {
+    data[p] = weightAt[p] > 0 ? weighted[p] / weightAt[p] : Number.NaN;
+  }
+  const some = planes.length > 0;
+  return {
+    data,
+    sigma: some ? Math.sqrt(varianceTotal) / weightTotal : Number.NaN,
+    nExposures: planes.reduce((sum, plane) => sum + plane.n_exposures, 0),
+    lamMin: some ? Math.min(...planes.map((plane) => plane.lam_min)) : Number.NaN,
+    lamMax: some ? Math.max(...planes.map((plane) => plane.lam_max)) : Number.NaN,
+    dateStart: some ? planes.map((plane) => plane.date_start).sort()[0] : null,
+    dateEnd: some
+      ? (planes
+          .map((plane) => plane.date_end)
+          .sort()
+          .at(-1) ?? null)
+      : null,
+  };
 }
 
 /** Pixel-wise difference of two frames, MJy/sr. */
@@ -177,53 +251,56 @@ export class FieldSynth {
       throw new RangeError(`unknown time bin ${timeBinId}`);
     }
     const planes = this.contributing(timeBinId, bins);
-    const weights = planes.map((plane) =>
-      weighting === "ivar" ? 1 / (plane.sigma * plane.sigma) : 1,
-    );
-
-    const weighted = new Float64Array(this.npix);
-    const weightAt = new Float64Array(this.npix);
-    let weightTotal = 0;
-    let varianceTotal = 0;
-    planes.forEach((plane, i) => {
-      const w = weights[i];
-      const pixels = this.planeData(plane);
-      for (let p = 0; p < this.npix; p++) {
-        const value = pixels[p];
-        if (Number.isFinite(value)) {
-          weighted[p] += w * value;
-          weightAt[p] += w;
-        }
-      }
-      weightTotal += w;
-      varianceTotal += w * w * plane.sigma * plane.sigma;
-    });
-
-    const data = new Float32Array(this.npix);
-    for (let p = 0; p < this.npix; p++) {
-      data[p] = weightAt[p] > 0 ? weighted[p] / weightAt[p] : Number.NaN;
-    }
-
-    const nExposures = planes.reduce((sum, plane) => sum + plane.n_exposures, 0);
-    const some = planes.length > 0;
+    const mix = combine(planes, this.npix, (plane) => this.planeData(plane), weighting);
     return {
       timeBin: timeBinId,
-      data,
-      sigma: some ? Math.sqrt(varianceTotal) / weightTotal : Number.NaN,
-      nExposures,
-      lamMin: some ? Math.min(...planes.map((plane) => plane.lam_min)) : Number.NaN,
-      lamMax: some ? Math.max(...planes.map((plane) => plane.lam_max)) : Number.NaN,
+      ...mix,
       waveBins: planes.map((plane) => plane.wave_bin),
-      dateStart: some ? planes.map((plane) => plane.date_start).sort()[0] : null,
-      dateEnd: some
-        ? (planes
-            .map((plane) => plane.date_end)
-            .sort()
-            .at(-1) ?? null)
-        : null,
       partial: planes.length !== this.unionSize(bins),
-      thin: nExposures < THIN_EXPOSURES,
+      thin: mix.nExposures < THIN_EXPOSURES,
     };
+  }
+
+  /** The wave bins a preset selects, on this field's own wave bins. */
+  presetBins(presetId: string): PresetBins {
+    return presetWaveBins(presetId, this.waveBins);
+  }
+
+  /**
+   * One stack of explicit wave bins over every time bin: every SPHEREx plane of those bins,
+   * combined with the frame formula. Legacy planes never take part.
+   */
+  stackForBins(bins: readonly number[], weighting: Weighting = DEFAULT_WEIGHTING): Stack {
+    const timeBins = [...this.manifest.time_bins].sort((a, b) => a.mjd_mid - b.mjd_mid);
+    const planes = timeBins.flatMap((t) => this.contributing(t.id, bins));
+    const mix = combine(planes, this.npix, (plane) => this.planeData(plane), weighting);
+    return {
+      ...mix,
+      waveBins: [...new Set(planes.map((plane) => plane.wave_bin))].sort((a, b) => a - b),
+      timeBins: [...new Set(planes.map((plane) => plane.time_bin))].sort((a, b) => a - b),
+    };
+  }
+
+  /** One stack of a single-image preset over every time bin. */
+  stackFor(presetId: string, weighting: Weighting = DEFAULT_WEIGHTING): Stack {
+    const selection = this.presetBins(presetId);
+    if (selection.kind !== "mono") {
+      throw new TypeError(`preset "${presetId}" has three channels: no single stack`);
+    }
+    return this.stackForBins(selection.bins, weighting);
+  }
+
+  /**
+   * The older surveys' images of this field (planes of kind "legacy"), in the order of
+   * presets.json `legacy_pairs`. Their pixels come from planeData(); they are never mixed into a
+   * SPHEREx frame, a stack or the limits of either.
+   */
+  legacyPlanes(): LegacyPlane[] {
+    const order = (plane: LegacyPlane) => {
+      const at = LEGACY_PAIRS.findIndex((pair) => pair.band === plane.band);
+      return at < 0 ? LEGACY_PAIRS.length : at;
+    };
+    return this.manifest.planes.filter(isLegacy).sort((a, b) => order(a) - order(b));
   }
 
   /** The frame of one time bin through a single-image preset. */

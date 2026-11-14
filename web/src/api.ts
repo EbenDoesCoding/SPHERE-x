@@ -7,6 +7,8 @@
  * - Error answers become a `FieldError` carrying the contract's `code`.
  * - A fixture falls back to the copy bundled with the site when the API cannot be reached, so
  *   the recorded fields work with no back end at all.
+ * - The engine answers at /api on the page's own origin, or at VITE_ENGINE_URL when that is set
+ *   (an origin such as https://engine.example; .env.example). Paths stay "/api/...".
  */
 import {
   type BuildingResponse,
@@ -14,9 +16,61 @@ import {
   type ErrorCode,
   FOV_CHOICES_ARCMIN,
   type Manifest,
+  type OverlaysResponse,
+  type SpectrumResponse,
+  type StatusResponse,
 } from "./contract";
 
 const FIELDS_URL = "/api/fields";
+const STATUS_URL = "/api/status";
+
+/** The engine's origin, without a trailing slash; "" when the page and the engine share one. */
+export const ENGINE_URL = String(import.meta.env.VITE_ENGINE_URL ?? "").replace(/\/+$/, "");
+
+/**
+ * An engine path ("/api/...") at the engine's address. A full URL, or a path that does not start
+ * with "/", is returned as it is: `frames.url` is opaque and is only resolved against the engine.
+ */
+export function engineUrl(path: string, base: string = ENGINE_URL): string {
+  const origin = base.replace(/\/+$/, "");
+  if (!origin || !path.startsWith("/") || path.startsWith("//")) return path;
+  return `${origin}${path}`;
+}
+
+/** The origin of a URL, resolved against `base`; null when it cannot be read. */
+function originOf(url: string, base: string): string | null {
+  try {
+    return new URL(url, base).origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when a URL the engine handed over (`frames.url`, opaque) points at the page's own origin or
+ * at the configured engine: the page makes no request to any other origin (CLAUDE.md, front end).
+ * A path ("/api/...", "frames.bin") stays on the page's origin and is always allowed.
+ */
+export function isEngineOrigin(
+  url: string,
+  base: string = ENGINE_URL,
+  page: string | null = globalThis.location?.href ?? null,
+): boolean {
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(url) && !url.startsWith("//")) return true;
+  const allowed = new Set<string>();
+  const engine = base.replace(/\/+$/, "");
+  if (engine) {
+    const origin = originOf(engine, page ?? engine);
+    if (origin) allowed.add(origin);
+  }
+  if (page) {
+    const origin = originOf(page, page);
+    if (origin) allowed.add(origin);
+  }
+  const target = originOf(url, page ?? (engine || "http://invalid.invalid"));
+  return target !== null && target !== "null" && allowed.has(target);
+}
+
 /** Poll interval when the API does not say, s. */
 const POLL_DEFAULT_S = 1;
 /** The API cancels a build nobody has polled for 20 s, so never wait long. */
@@ -84,9 +138,11 @@ export interface LoadOptions {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Replaceable for tests: clock in ms. */
   now?: () => number;
+  /** Replaceable for tests: the engine's origin (default ENGINE_URL). */
+  engine?: string;
 }
 
-type Context = Required<Pick<LoadOptions, "fetchImpl" | "sleep" | "now">> &
+type Context = Required<Pick<LoadOptions, "fetchImpl" | "sleep" | "now" | "engine">> &
   Pick<LoadOptions, "signal" | "onProgress">;
 
 /** Raised internally when nothing that speaks the contract answered. */
@@ -319,11 +375,18 @@ async function fetchFrames(
 }
 
 async function loadFromApi(request: FieldRequest, context: Context): Promise<LoadedField> {
-  const manifest = await requestManifest(fieldUrl(request), context);
+  const manifest = await requestManifest(engineUrl(fieldUrl(request), context.engine), context);
   if (manifest.status === "empty" || !manifest.frames) {
     return { manifest, frames: null, source: "api" };
   }
-  const frames = await fetchFrames(manifest.frames.url, manifest, context);
+  const framesUrl = engineUrl(manifest.frames.url, context.engine);
+  if (!isEngineOrigin(framesUrl, context.engine)) {
+    throw new FieldError(
+      "bad_response",
+      "The manifest points its frame file at another site, so it is not loaded.",
+    );
+  }
+  const frames = await fetchFrames(framesUrl, manifest, context);
   return { manifest, frames, source: "api" };
 }
 
@@ -350,6 +413,30 @@ async function loadBundled(name: string, context: Context): Promise<LoadedField>
   }
 }
 
+function contextOf(options: LoadOptions): Context {
+  return {
+    signal: options.signal,
+    onProgress: options.onProgress,
+    fetchImpl: options.fetchImpl ?? ((input, init) => fetch(input, init)),
+    sleep: options.sleep ?? defaultSleep,
+    now: options.now ?? (() => Date.now()),
+    engine: options.engine ?? ENGINE_URL,
+  };
+}
+
+/**
+ * The copy of a recorded field bundled with the site, without asking the engine first: for when
+ * a load has just shown that no engine answers. Rejects with a `FieldError` ("fixture_missing"
+ * when it is not bundled), or with the abort reason.
+ */
+export async function loadBundledField(
+  name: string,
+  options: LoadOptions = {},
+): Promise<LoadedField> {
+  checkRequest({ fixture: name });
+  return loadBundled(name, contextOf(options));
+}
+
 /**
  * Loads a field by position or by fixture name.
  * Rejects with a `FieldError`, or with the abort reason when `options.signal` aborts.
@@ -359,13 +446,7 @@ export async function loadField(
   options: LoadOptions = {},
 ): Promise<LoadedField> {
   checkRequest(request);
-  const context: Context = {
-    signal: options.signal,
-    onProgress: options.onProgress,
-    fetchImpl: options.fetchImpl ?? ((input, init) => fetch(input, init)),
-    sleep: options.sleep ?? defaultSleep,
-    now: options.now ?? (() => Date.now()),
-  };
+  const context = contextOf(options);
   try {
     return await loadFromApi(request, context);
   } catch (error) {
@@ -375,5 +456,167 @@ export async function loadField(
       "unreachable",
       "The Tombaugh API cannot be reached, so a new field cannot be built right now.",
     );
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sections 7.1 and 7.3: the spectrum and the catalogue overlays of a field on screen
+// ---------------------------------------------------------------------------------------------
+
+/** Give up waiting for overlays after this long, ms. */
+const OVERLAYS_DEADLINE_MS = 60_000;
+/** Give up waiting for a spectrum after this long, ms (it reads every exposure again). */
+const SPECTRUM_DEADLINE_MS = 180_000;
+
+const SPECTRUM_STATES = ["ok", "indicative", "saturated", "contaminated", "no_data"];
+
+/** Progress of a spectrum the engine is still measuring (an HTTP 202, as for a build). */
+export interface MeasureProgress {
+  done: number | null;
+  total: number | null;
+}
+
+export interface ExtraOptions
+  extends Pick<LoadOptions, "signal" | "fetchImpl" | "sleep" | "now" | "engine"> {
+  onProgress?: (progress: MeasureProgress) => void;
+}
+
+/** A field key as the manifest gives it; anything else is refused before a request. */
+function checkKey(key: string): void {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) {
+    throw new FieldError("bad_request", "That is not the key of a field.");
+  }
+}
+
+/**
+ * Contract 7.1: a spectrum missing some exposures comes with this header, "<n> of <m> exposures
+ * not measured; not cached".
+ */
+const INCOMPLETE_HEADER = "x-tombaugh-incomplete";
+
+/** A spectrum as the engine answered it, with its X-Tombaugh-Incomplete header when it sent one. */
+export type SpectrumAnswer = SpectrumResponse & { incomplete?: string };
+
+/** GETs a JSON answer of the engine, polling the same URL while it answers 202. */
+async function pollJson(
+  url: string,
+  context: Context,
+  deadlineMs: number,
+  onProgress?: (progress: MeasureProgress) => void,
+  onAnswer?: (response: Response) => void,
+): Promise<Record<string, unknown>> {
+  const startedAt = context.now();
+  for (;;) {
+    let response: Response;
+    let body: Record<string, unknown>;
+    try {
+      response = await fetchWithRetry(url, "application/json", context);
+      body = await apiBody(response);
+    } catch (error) {
+      if (error instanceof ApiUnreachable) {
+        throw new FieldError("unreachable", "The Tombaugh API cannot be reached right now.");
+      }
+      throw error;
+    }
+    if (response.status === 202 || body.status === "building") {
+      const building = body as Partial<BuildingResponse>;
+      onProgress?.({
+        done: building.progress?.done ?? null,
+        total: building.progress?.total ?? null,
+      });
+      if (context.now() - startedAt > deadlineMs) {
+        throw new FieldError("timeout", "The engine did not answer in time. Try again.");
+      }
+      await context.sleep(pollDelayMs(building), context.signal);
+      continue;
+    }
+    if (!response.ok || body.status === "error") throw errorFrom(body, response);
+    onAnswer?.(response);
+    return body;
+  }
+}
+
+function extraContext(options: ExtraOptions): Context {
+  return contextOf({ ...options, onProgress: undefined });
+}
+
+/** `GET /api/fields/{key}/overlays`: Gaia DR3 and CatWISE sources of a field (section 7.3). */
+export async function loadOverlays(
+  key: string,
+  options: ExtraOptions = {},
+): Promise<OverlaysResponse> {
+  checkKey(key);
+  const context = extraContext(options);
+  const url = engineUrl(`${FIELDS_URL}/${key}/overlays`, context.engine);
+  const body = await pollJson(url, context, OVERLAYS_DEADLINE_MS);
+  const upstreams = body.upstreams as Record<string, unknown> | undefined;
+  if (
+    body.status !== "ok" ||
+    !Array.isArray(body.gaia) ||
+    !Array.isArray(body.catwise) ||
+    typeof upstreams !== "object" ||
+    upstreams === null
+  ) {
+    throw new FieldError("bad_response", "The catalogue answer does not follow the contract.");
+  }
+  return body as unknown as OverlaysResponse;
+}
+
+/** The `spectrum` URL of a position: decimal degrees, as many digits as given. */
+export function spectrumUrl(key: string, ra: number, dec: number): string {
+  const query = new URLSearchParams({ ra: String(ra), dec: String(dec) });
+  return `${FIELDS_URL}/${key}/spectrum?${query}`;
+}
+
+/** `GET /api/fields/{key}/spectrum?ra=&dec=`: quick-look spectrophotometry (section 7.1). */
+export async function loadSpectrum(
+  key: string,
+  ra: number,
+  dec: number,
+  options: ExtraOptions = {},
+): Promise<SpectrumAnswer> {
+  checkKey(key);
+  if (!Number.isFinite(ra) || ra < 0 || ra >= 360 || !Number.isFinite(dec) || Math.abs(dec) > 90) {
+    throw new FieldError("bad_request", "That position is outside the sky.");
+  }
+  const context = extraContext(options);
+  const url = engineUrl(spectrumUrl(key, ra, dec), context.engine);
+  const said: { incomplete: string | null } = { incomplete: null };
+  const body = await pollJson(url, context, SPECTRUM_DEADLINE_MS, options.onProgress, (answer) => {
+    said.incomplete = answer.headers.get(INCOMPLETE_HEADER);
+  });
+  if (
+    body.status !== "ok" ||
+    !SPECTRUM_STATES.includes(String(body.state)) ||
+    !Array.isArray(body.points) ||
+    !Array.isArray(body.binned)
+  ) {
+    throw new FieldError("bad_response", "The spectrum answer does not follow the contract.");
+  }
+  const spectrum = body as unknown as SpectrumResponse;
+  return said.incomplete ? { ...spectrum, incomplete: said.incomplete } : spectrum;
+}
+
+/**
+ * `GET /api/status` (contract section 7.4): one attempt, no retries. Resolves to null when no
+ * engine answers or the answer is not the contract's, so callers can say what is unavailable.
+ * Rejects only with the abort reason.
+ */
+export async function loadStatus(
+  options: Pick<LoadOptions, "signal" | "fetchImpl" | "engine"> = {},
+): Promise<StatusResponse | null> {
+  const fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
+  try {
+    const response = await fetchImpl(engineUrl(STATUS_URL, options.engine ?? ENGINE_URL), {
+      headers: { Accept: "application/json" },
+      signal: options.signal,
+    });
+    if (!response.ok || response.headers.has(PROXY_ERROR_HEADER)) return null;
+    const body = await contractBody(response);
+    if (body === null || body.status !== "ok") return null;
+    return body as unknown as StatusResponse;
+  } catch (error) {
+    if (isAbort(error) || options.signal?.aborted) throw error;
+    return null;
   }
 }
