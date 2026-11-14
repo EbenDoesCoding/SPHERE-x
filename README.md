@@ -9,7 +9,7 @@ name.
 ## Status
 
 **Being built during the NASA Space Apps 2026 hackathon weekend (14 and 15 November 2026).** This section
-describes the repository on Saturday 14 November 2026 at about 19:30 GMT. It holds two lines of work that
+describes the repository on Saturday 14 November 2026 at about 23:30 GMT. It holds two lines of work that
 were built apart and merged that evening: the team backend (`src/backend/`) and a foundation with a frames
 engine (`api/`), a web app (`web/`) and two recorded fields (`cache/fixtures/`).
 
@@ -24,19 +24,34 @@ Works today, on real data:
 - **Frames engine** (`api/`), on a developer machine: for any position with SPHEREx coverage it finds the
   public exposures at IRSA, reads only the needed rows from the public bucket, masks bad pixels, registers
   north-up and stacks per visit and wavelength bin. Measured from the hackathon venue: a new 6 arcmin field
-  in 30 to 80 s, a 10 arcmin field in 56 s, then instant from the cache. 702 tests pass without network. Its
-  container image builds.
+  in 30 to 80 s, a 10 arcmin field in 56 s, then instant from the cache. Since Saturday evening (pipeline
+  0.3.0) it also puts the older surveys' images of the same patch on the field's grid (AllWISE W1 and W2
+  from 2010, 2MASS J, H and Ks from 1997 to 2001), serves catalogue markers (Gaia DR3 and CatWISE positions
+  carried to the date of each visit) and measures a quick-look spectrum at a clicked position. 835 tests
+  pass without network. Its container image builds and serves the recorded fields.
 - **Two recorded fields**, WISE 0855−0714 and Barnard's Star, in `cache/fixtures/`. They are real SPHEREx
-  data saved by the engine, and the web app carries its own copies, so they load with no server at all.
+  data saved by the engine, each with five older-survey images, and the web app carries its own copies, so
+  they load with no server at all.
+- **The web site** (`web/`), built from the design files in `docs/design/`: a landing page at `/` and the
+  comparator at `/look/`. The comparator takes its frames from the engine (or the bundled recorded fields)
+  and uses the team backend's `/resolve` and `/stars` for search by name and for the hint about objects
+  that have moved away from their catalogue position. All twelve removable parts of the design are in:
+  search by name, the moved-object banner, hold to flip, side by side, the difference image, then and now,
+  contrast and invert, the spotlight zoom, three-colour, the spectrum panel, catalogue markers and copy
+  link. Each has a switch in `web/src/comparator/features.ts`. Checked in a browser at 1280×720, 1440×900
+  and 390×844, with the engine running and with no back end at all. Without the engine, the spectrum and
+  the catalogue markers say that they are not available; everything else works on the two recorded fields.
 
-Being built tonight:
+Measured on real data on Saturday (details and limits in `docs/ENGINE_NOTES.md`):
 
-- **The web site** (`web/`), from the design files in `docs/design/`: a landing page at `/` and the comparator
-  at `/look/`. The comparator takes its frames from the engine (or the bundled recorded fields) and uses the
-  team backend's `/resolve` and `/stars` for search by name or coordinates and for the hint about objects
-  that have moved away from their catalogue position. Twelve further parts (among them the difference image,
-  side by side, then and now, the spectrum panel and catalogue markers) are designed so that each can be
-  left out; which of them are ready by the pitch is not known yet.
+- Typing the challenge's own WISE 0855 coordinates brings up "WISE 0855-0714 was here in 2010. It is now
+  127″ to the west." with a jump to the present position.
+- The 2010 WISE image of the Barnard field shows the star 168″ south of where SPHEREx sees it in September
+  2026 (10.4″ a year over 16.2 years; Gaia DR3 gives 10.39″). Older-survey images register on the SPHEREx frames to 0.2 to 0.3″
+  rms. Positions compare between surveys; brightness does not, and the page says so.
+- The spectrum of WISE 0855 reads 562 ± 45 µJy at 4.4 to 4.8 µm and nothing below 3.8 µm. Unsaturated
+  field stars read within about 3% of 2MASS and AllWISE. Barnard's Star answers "Saturated: no reliable
+  brightness", and RW Aurigae "indicative only".
 
 Not done:
 

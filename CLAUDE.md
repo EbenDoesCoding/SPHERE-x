@@ -3,7 +3,7 @@
 Shared context for every Claude instance on this repo. Read this file first. Do NOT re-scan the whole repo each prompt.
 Confidence tags: **[CHALLENGE]** = from the official brief. **[TEAM]** = decided by the team. **[MEASURED]** = measured by us on real SPHEREx data, or read in a primary source, on 14 Nov 2026. **[VERIFY]** = not yet checked. Never present [VERIFY] items as fact in UI, docs, or pitch.
 
-State described: Saturday 14 November 2026, about 19:30 Irish time. The repository holds two lines of work built apart and merged on branch `frontend/main`: the team backend with its documents (`main`), and a foundation built on a separate local branch (frames engine, web app, recorded fields, prototypes). The merge left the team's files unchanged. Open decisions are listed once, in §14.
+State described: Saturday 14 November 2026, about 23:30 Irish time. The repository holds two lines of work built apart and merged on branch `frontend/main`: the team backend with its documents (`main`), and a foundation built on a separate local branch (frames engine, web app, recorded fields, prototypes). The merge left the team's files unchanged. Open decisions are listed once, in §14.
 
 ---
 
@@ -29,7 +29,7 @@ docs/RUNBOOK.md, docs/DATA_SOURCES.md, docs/AI_USE.md   deploy and operate; data
 **Which contract governs what.**
 - `docs/CONTRACT.md`: the team backend. Its owner (B2) updates it before an endpoint changes.
 - `docs/CONTRACT_FIELDS.md` (Contract v1.0, with `docs/contract/`): the frames engine, its frame file and the recorded fields; `web/src/contract.ts` mirrors it. Frozen: a change needs its owner, a version bump, and regenerated fixtures and vectors in the same pull request.
-- The comparator calls `/resolve` and `/stars` from the first and `/api/fields` from the second. It does not use the team backend's `/frames`, `/overlay` or `/presets` today.
+- The comparator calls `/resolve` and `/stars` from the first and `/api/fields`, `/api/fields/{key}/overlays` and `/api/fields/{key}/spectrum` from the second. It does not use the team backend's `/frames`, `/overlay` or `/presets` today.
 
 **Commands** (Python 3.12 with uv; Node 24 with npm):
 ```bash
@@ -40,7 +40,7 @@ cd web && npm install && npm run dev        # http://localhost:5173/ and /look/;
 cd web && npm test && npm run lint && npm run build
 ```
 Port 8080 taken? Run the engine on another port (`--port 8081`) and the web app with `TOMBAUGH_API_URL=http://localhost:8081 npm run dev`.
-The site's addresses come from `web/.env.local` (copy `web/.env.example`): `VITE_TEAM_API_URL` for the team backend, `VITE_ENGINE_URL` for the engine (empty: same origin, `/api` proxied). With no engine running, the two recorded fields still load from the copies bundled with the site.
+The site's addresses come from `web/.env.local` (copy `web/.env.example`): `VITE_TEAM_API_URL` for the team backend, `VITE_ENGINE_URL` for the engine (empty: same origin, `/api` proxied). With no engine running, the two recorded fields still load from the copies bundled with the site; the spectrum and the catalogue markers then say they are not available.
 
 **Rules for all code:**
 - Real data only. Synthetic arrays only inside tests, named as such (`synthetic_*` in the engine), never shipped.
@@ -97,15 +97,15 @@ Personas: citizen scientist (Backyard Worlds style volunteer), teacher/student, 
 
 What it does, in five points, with the state of each:
 1. **Correct blinking.** Frames are registered, north-up, wavelength-matched stacks per visit on one brightness scale, so what blinks is the sky and not the filter. Built: the engine (any position with coverage, at most 600 exposures, field 6′ default and 10′ max, honest "no coverage yet", thin and partial frames marked) and the two recorded fields.
-2. **Then & Now.** The 2010–11 WISE image (and 2MASS where usable) on the same grid as a SPHEREx stack at nearly the same wavelengths. Positions are comparable between surveys; brightness is not. Designed; no code fetches WISE or 2MASS images yet.
-3. **What it is, not only that it moved.** Click an object for quick-look spectrophotometry (0.75–5 µm) at the position predicted from catalogue motion. Designed (spectrum panel); the engine's `/spectrum` answers "not built yet".
-4. **The coordinate trap, solved.** Typed coordinates are checked for fast movers that used to be there ("it is now 126" west: jump"). Being built tonight, on the team backend's `/resolve` and `/stars`.
+2. **Then & Now.** The 2010 AllWISE image (and 2MASS, 1997–2001) on the same grid as a SPHEREx stack at nearly the same wavelengths. Positions are comparable between surveys; brightness is not. Built: the engine adds AllWISE W1/W2 and 2MASS J/H/Ks planes to every field (pipeline 0.3.0; registration 0.2–0.3" rms on field stars), both recorded fields carry them, and the comparator's Then and now view shows them.
+3. **What it is, not only that it moved.** Click an object for quick-look spectrophotometry (0.75–5 µm) at the position predicted from catalogue motion. Built: the engine's `/spectrum` (aperture or joint fit with catalogued neighbours; states ok, indicative, saturated, contaminated, no data) and the spectrum panel with chart, table and CSV. It needs the engine: a bundled field alone says the spectrum is not available.
+4. **The coordinate trap, solved.** Typed coordinates are checked for fast movers that used to be there ("WISE 0855-0714 was here in 2010. It is now 127″ to the west.", with a jump). Built: a short list of known movers that needs no network, plus Gaia through the team backend's `/stars`; names resolve through `/resolve`.
 5. **Honest and durable.** Dates, exposure counts, wavelength range and provenance on every frame. No synthetic imagery. New releases need no code change. Built in the engine's manifest; shown by the frame label and the provenance line.
 
-### Being built tonight in `web/`, from `docs/design/`
+### Built in `web/` on Saturday, from `docs/design/`
 - Landing page (`/`): the 1930 Pluto story, two real pairs to flip (Barnard's Star, WISE 0855), what it shows and its limits, a link to the comparator.
 - Comparator (`/look/`), the layout that stays when every removable part is left out: search by decimal degrees, band (eight options), field of view, playback (Space and the arrows; never autoplays), the dated frames timeline, the image with scale bar, readout and compass, recentre, frame label, legend with the no-data hatch, caveat list, the "Recorded field" or "Live data" chip, provenance with the two DOIs, and the note "Same brightness scale for every frame".
-- The twelve removable parts (`docs/design/comparator/Handoff-removable.dc.html`), each of which can be left out without a gap: search by name or by hours and degrees · moved-object banner · hold to flip · side by side · difference image · then and now · contrast and invert · spotlight zoom · three-colour · spectrum panel · catalogue markers · copy link. A part that is not finished is switched off in `web/src/comparator/features.ts`, never left half done.
+- The twelve removable parts (`docs/design/comparator/Handoff-removable.dc.html`), each of which can be left out without a gap: search by name or by hours and degrees · moved-object banner · hold to flip · side by side · difference image · then and now · contrast and invert · spotlight zoom · three-colour · spectrum panel · catalogue markers · copy link. All twelve are built and switched on in `web/src/comparator/features.ts`; a part that stops working is switched off there, never left half done. Name search is on only when `VITE_TEAM_API_URL` is set.
 
 ### Later, only after the above works
 Motion readout against the Gaia prediction · single-exposure events and an "hours" mode · draggable wavelength window · flag overlay and exposure table · GIF export and candidate card · embed and WiseView-style links · wider fields · a one-screen About (methods, limits, validation table, data notes, AI use) · Irish-language toggle (bonus for the local prize).
@@ -123,7 +123,10 @@ Automatic "discovery" claims, accounts, any simulated sky, a general FITS viewer
 - WISE 0855: invisible in single frames; visible only in 4.4–5.0 µm stacks; blended with a background star 4–11" away. Fitted jointly it moved 4.36 ± 0.34" in six months (4.54" predicted). Gaia does not contain it; use CatWISE.
 - RW Aur: +51% at 1.2 µm and −46% at 4.6 µm across three visits; core flagged OVERFLOW, so indicative only. R Dra: saturated in almost every exposure; only the 4–5 µm halo is usable, as a relative proxy.
 - Eps Indi Ba+Bb is unresolved (one blended source) and its motion test has not been run. [VERIFY]
-- Unsaturated-star photometry agrees with 2MASS and AllWISE to a median ratio of 0.987 with 2.9% scatter (six stars).
+- Unsaturated-star photometry agrees with 2MASS and AllWISE within about 3%: median ratio 0.987 with 2.9% scatter in the morning prototype (six stars); 1.029 (five stars) and 1.005 with 3.4% scatter (an independent check) through the engine's `/spectrum` in the evening. The differences between these runs are unexplained.
+- Spectrum of WISE 0855 through `/spectrum` (joint fit with two neighbours): 562 ± 45 µJy at 4.4–4.8 µm, nothing below 3.8 µm. Blank sky reads low by 15–35 µJy at some positions; binned errors carry a floor for it. A click 6–15" from a bright star picks up its light and is still labelled "ok" (known limit).
+- Then & Now registration: AllWISE W1 against the SPHEREx frame agrees to 0.29" rms (10 stars, WISE 0855 field) and 0.22" (16 stars, Barnard field) with no fitted shift. The 2010 W2 image shows WISE 0855 at the brief's coordinates (30σ) and nothing at its 2026 position; SPHEREx still shows a fainter source 2–4" from the 2010 position, not yet identified, so the 2010 image there is not the dwarf alone. The 2010 AllWISE image shows Barnard's Star 168" south of where SPHEREx sees it in September 2026 (10.4"/yr over 16.2 years; Gaia 10.39"/yr), which is 161" south of the recorded field's centre.
+- CatWISE motions are mostly unreliable for faint sources (over 200 false fast movers in the Barnard field). The engine moves a CatWISE marker only after strict checks; WISE 0855's track comes from the published astrometry (Kirkpatrick et al. 2021 via SIMBAD).
 - Flag masks from the SPHEREx Explanatory Supplement: stack `0x3FD2CEC5`, photometry `0x3C028E44`, background `0x3C2A8E47`. Never mask the SOURCE bit; never drop the SIP distortion terms; a strict mask erases saturated stars, so hatch their cores instead.
 - CDS Strasbourg (SIMBAD, VizieR, Aladin tiles and script) is down this weekend. Use the CfA and IDIA mirrors; keep Aladin Lite off the critical path.
 - Never fabricate data, endpoints, column names, or astronomy values. If unsure, say "unverified" in code comments and UI.
@@ -154,8 +157,8 @@ browser ── /  and  /look/     static site (web/)                 not deploye
 | Part | Stack | Data path | State |
 |---|---|---|---|
 | Team backend `src/backend` | Python ≥ 3.12, FastAPI, astropy, astroquery, reproject, Pillow; uv | IRSA TAP and cutouts → PNG frames, one stretch per request; Gaia DR3 from the ESA archive; names through Sesame | Deployed by its owner on Render's free tier (sleeps when idle, 512 MB, disk reset on every deploy); address not in the repo. Started locally on 14 Nov: `/health`, `/resolve`, `/stars` correct. A new live `/frames` often takes 1 to 2 min |
-| Frames engine `api/` | Python 3.12, FastAPI, Astropy, numpy/scipy, synchronous `requests` with a thread pool; uv, ruff, pytest | IRSA SIA discovery; range reads of only the needed rows from the public bucket; masked, registered north-up, stacked per visit and wavelength bin; one float16 file per field, disk cache | 702 tests pass without network; container image builds; not deployed. From the venue: a new 6′ field in 30 to 80 s, a 10′ field in 56 s, then instant from cache |
-| Static site `web/` | Vite, React, TypeScript (strict), Canvas 2D, Biome, Vitest (`node`), npm; self-hosted fonts | `VITE_ENGINE_URL`, `VITE_TEAM_API_URL`; recorded fields copied in at build time | Being rebuilt tonight from `docs/design/`; not deployed |
+| Frames engine `api/` | Python 3.12, FastAPI, Astropy, numpy/scipy, synchronous `requests` with a thread pool; uv, ruff, pytest | IRSA SIA discovery; range reads of only the needed rows from the public bucket; masked, registered north-up, stacked per visit and wavelength bin; one float16 file per field, disk cache; since pipeline 0.3.0 also AllWISE and 2MASS planes on the field's grid, `/overlays` (Gaia DR3, CatWISE) and `/spectrum` | 835 tests pass without network; container image builds; not deployed. From the venue: a new 6′ field in 30 to 80 s, a 10′ field in 56 s, then instant from cache |
+| Static site `web/` | Vite, React, TypeScript (strict), Canvas 2D, Biome, Vitest (`node`), npm; self-hosted fonts | `VITE_ENGINE_URL`, `VITE_TEAM_API_URL`; recorded fields copied in at build time | Built from `docs/design/` on Saturday evening: landing page and comparator with all twelve removable parts; 862 tests; checked in a browser at 1280×720, 1440×900 and 390×844 with and without the engine; not deployed |
 | Proxy for `/api` | Cloudflare Pages Function `web/functions/api/[[path]].ts`; Vercel example `web/vercel.example.json` | One origin for site and engine, no CORS | Never run |
 | CI | `.github/workflows/ci.yml`: engine (ruff, pytest), web (lint, test, build); no network | No job for `src/backend` | Not yet run on GitHub |
 
@@ -191,8 +194,8 @@ This file names roles, not people; the team documents do the same (B1, B2). Hold
 |---|---|
 | Sat 16:35 | **Done.** Foundation works locally: engine on real data for any position, two recorded fields, first viewer, container image builds |
 | Sat 19:00 | **Done.** `main` merged into `frontend/main`; design sources in `docs/design/`; tokens, fonts and component styles in `web/` |
-| Sat 21:30 | Designed landing page and comparator work locally on the two recorded fields; search and the moved-object hint work against a local team backend |
-| Sat 23:30 | Deployed: the site and live frames for any coordinate on public URLs (needs decisions 1 to 3 in §14) |
+| Sat 23:30 | **Done** (two hours late). Designed landing page and comparator work locally on the two recorded fields and on live fields; search and the moved-object hint work against a local team backend; spectrum, catalogue markers and Then & Now work against a local engine |
+| Sun 01:00 | Deployed: the site and live frames for any coordinate on public URLs (needs decisions 1 to 3 in §14). Not started: nothing from this branch is pushed or deployed |
 | Sun 02:00 | Remaining parts that work are in; five targets checked. **Feature freeze** |
 | Sun 04:30 | Rehearsal: the demo script passes three times in a row on production; tagged |
 | Sun 06:00 | Team confirmed in person at the desk (named primary and backup) |
@@ -254,13 +257,15 @@ Cut rule: at every gate, what does not work is cut or hidden, never faked. Never
 5. [ ] **Licence**: keep Apache-2.0 (`LICENSE`, added as a proposal; also named in `api/pyproject.toml` and `web/package.json`) or choose another and change all three.
 6. [ ] **AI disclosure**: confirm or change the draft `docs/AI_USE.md` (its "TEAM TO CONFIRM" lines), and the wording for the NASA project page. Space Apps asks that AI not be used to come up with the idea and that AI-generated code be acknowledged in descriptive text and metadata.
 7. [ ] **Fields contract clarification of 14 Nov**: `frames.url` is opaque and ends in `?v=<hash>` (`docs/CONTRACT_FIELDS.md`). Sign it off as a clarification of v1.0, or ask for a version bump instead.
+8. [ ] **Fields contract clarifications of pipeline 0.3.0** (`docs/CONTRACT_FIELDS.md` sections 5, 7.1 and 7.3; JSON shapes unchanged): older-survey planes follow the SPHEREx planes and one that cannot be matched on field stars is left out; `snapped_to.catalog` may be "simbad"; an incomplete spectrum is marked by the `X-Tombaugh-Incomplete` header; binned errors include background terms; `track` on a CatWISE source. Sign them off or ask for a version bump.
+9. [ ] **Choices made in the comparator that the design does not state**: CatWISE markers only within 15" of the ring plus tracked movers; the spectrum chart's flux axis follows the data; Then & Now pairs W1 with a band that has no older image of its own; the new caveat sentences for engine 0.3.0 warnings. Listed in `web/src/comparator/CONTRACT.md`.
 
 **Other open items**
 - [ ] Ask the desk: are slides required, sent in advance, is a live demo from our own laptop allowed?
 - [ ] Name the two people at the desk for Sunday 06:00.
 - [ ] Agree who holds each role in §10, including the frames engine if it stays.
 - [ ] Write the Render address where the team can find it (it is needed for `VITE_TEAM_API_URL` and for the checks in `docs/VALIDATION.md`, all unticked).
-- [ ] Still to test on real data: Eps Indi B motion (a live build at RA 331.096, Dec -56.801 shows a bright source at the predicted place in four visits; its motion is not measured), the Then & Now blink, a solar-system mover (Pluto or comet 3I/ATLAS).
+- [ ] Still to test on real data: Eps Indi B motion (a live build at RA 331.096, Dec -56.801 shows a bright source at the predicted place in four visits; its motion is not measured), a solar-system mover (Pluto or comet 3I/ATLAS), and what the faint source near WISE 0855's 2010 position is (§5). Then & Now itself is tested on both recorded fields.
 - [ ] Science owner: outlier rejection per detector (as built) or per wavelength bin; one rule for saturated cores (see the known limits in `docs/ENGINE_NOTES.md`).
 - [x] Latest SPHEREx release and access method confirmed (DR1 + QR3, SIA for discovery, S3 range reads).
 - [x] Test-target astrometry checked against Gaia DR3, CatWISE and SIMBAD (see `docs/plan.md`).
