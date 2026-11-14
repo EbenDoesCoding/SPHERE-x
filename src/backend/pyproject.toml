@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.162.7",
     "numpy>=2.5.4",
     "pillow>=13.0.0",
+    "reproject>=0.21.0",
     "requests>=2.34.2",
     "uvicorn[standard]>=0.54.0",
 ]
