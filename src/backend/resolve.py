@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from astropy.coordinates import SkyCoord
 from astropy.coordinates.name_resolve import NameResolveError
 
