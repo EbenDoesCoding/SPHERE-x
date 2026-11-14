@@ -750,6 +750,53 @@ describe("where a frame file may come from", () => {
     expect(isEngineOrigin("https://other.example/x", "", null)).toBe(false);
   });
 
+  it("judges an address by how the browser reads it, not by how it looks", () => {
+    const page = "https://tombaugh.example/look/?target=wise0855";
+    // Each of these looks like a path or like nothing at all, and the URL parser takes every one
+    // of them to other.example: a backslash counts as a slash, leading spaces and control
+    // characters are dropped, and tabs and line breaks are removed wherever they are.
+    const disguised = [
+      "/\\other.example/frames.bin",
+      "\\\\other.example/frames.bin",
+      "\\/other.example/frames.bin",
+      " //other.example/frames.bin",
+      "\t//other.example/frames.bin",
+      "/\t/other.example/frames.bin",
+      "ht\ntp://other.example/frames.bin",
+      "\u0001https://other.example/frames.bin",
+    ];
+    for (const url of disguised) {
+      expect(new URL(url, page).hostname, url).toBe("other.example");
+      expect(isEngineOrigin(url, "", page), url).toBe(false);
+      expect(isEngineOrigin(url, "https://engine.example", page), url).toBe(false);
+      expect(isEngineOrigin(url, "", null), url).toBe(false);
+    }
+    // Addresses that cannot leave the page or the engine stay allowed, with or without a page.
+    expect(isEngineOrigin("/api/fields/k/frames.bin?v=1", "", null)).toBe(true);
+    expect(isEngineOrigin("frames.bin", "https://engine.example", null)).toBe(true);
+    expect(isEngineOrigin("https://engine.example/api/x", "https://engine.example", null)).toBe(
+      true,
+    );
+    expect(isEngineOrigin("/api/x", "/", page)).toBe(true);
+    // Opaque origins are never the page or the engine.
+    expect(isEngineOrigin("data:application/octet-stream,AAAA", "", page)).toBe(false);
+    expect(isEngineOrigin("file:///etc/hosts", "", page)).toBe(false);
+  });
+
+  it("refuses a disguised address in a manifest before fetching it", async () => {
+    const { frames } = synthetic_manifest;
+    if (!frames) throw new Error("the synthetic manifest has a frame file");
+    for (const url of ["/\\other.example/frames.bin", "\t//other.example/frames.bin"]) {
+      const manifest: Manifest = { ...synthetic_manifest, frames: { ...frames, url } };
+      const { urls, options } = harness(() => json(manifest));
+      const error = await failure(
+        loadField({ ra: 10, dec: 20, fov: 6 }, { ...options, engine: "" }),
+      );
+      expect(error.code, url).toBe("bad_response");
+      expect(urls, url).toEqual(["/api/fields?ra=10&dec=20&fov=6"]);
+    }
+  });
+
   it("refuses a manifest whose frame file is on another site, before fetching it", async () => {
     const { frames } = synthetic_manifest;
     if (!frames) throw new Error("the synthetic manifest has a frame file");

@@ -46,28 +46,32 @@ function originOf(url: string, base: string): string | null {
   }
 }
 
+/** Stands in for the page where there is none (tests, tools), so that a path stays "on the page". */
+const NO_PAGE = "http://page.invalid/";
+
 /**
  * True when a URL the engine handed over (`frames.url`, opaque) points at the page's own origin or
  * at the configured engine: the page makes no request to any other origin (CLAUDE.md, front end).
- * A path ("/api/...", "frames.bin") stays on the page's origin and is always allowed.
+ *
+ * The URL is always resolved the way `fetch` will resolve it, against the page, and only the
+ * resulting origin is compared. There is no shortcut for text that "looks like a path": the URL
+ * parser reads "/\host", " //host" and "ht\ntp://host" as other sites, so only its answer counts.
  */
 export function isEngineOrigin(
   url: string,
   base: string = ENGINE_URL,
   page: string | null = globalThis.location?.href ?? null,
 ): boolean {
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(url) && !url.startsWith("//")) return true;
+  const pageUrl = page ?? NO_PAGE;
   const allowed = new Set<string>();
+  const own = originOf(pageUrl, pageUrl);
+  if (own) allowed.add(own);
   const engine = base.replace(/\/+$/, "");
   if (engine) {
-    const origin = originOf(engine, page ?? engine);
+    const origin = originOf(engine, pageUrl);
     if (origin) allowed.add(origin);
   }
-  if (page) {
-    const origin = originOf(page, page);
-    if (origin) allowed.add(origin);
-  }
-  const target = originOf(url, page ?? (engine || "http://invalid.invalid"));
+  const target = originOf(url, pageUrl);
   return target !== null && target !== "null" && allowed.has(target);
 }
 
