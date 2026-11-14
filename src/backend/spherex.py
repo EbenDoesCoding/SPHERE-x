@@ -37,7 +37,9 @@ import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-
+import io
+import requests
+from astropy.io.votable import parse_single_table
 import astropy.units as u
 import numpy as np
 from astropy.coordinates import SkyCoord
@@ -72,6 +74,11 @@ MODES = ("best", "group", "stack", "all")
 MAX_WORKERS = 10           # IRSA tutorial suggests 7-12 parallel requests
 RETRY_WORKERS = 3          # second pass for failed cutouts uses fewer parallel requests (gentler on IRSA)
 MAX_RETRIES = 3            # IRSA's tutorial saw transient failures on a noticeable share of cutouts
+SIA_URL = "https://irsa.ipac.caltech.edu/SIA"
+SIA_COLLECTIONS = ("spherex_dr1", "spherex_qr3")  # preferred first; QR2 is no longer searchable
+SIA_RADIUS_DEG = 0.001     # about a point: exposures that contain the target position
+SIA_ATTEMPTS = 6           # IRSA resets connections in bursts; short retries get through
+SIA_RETRY_DELAY_S = 3
 OVERSAMPLE = 2             # output pixels per native pixel (helps sub-pixel motion look smooth)
 STRETCH_PERCENTILES = (1.0, 99.0)
 BAD_FLAG_MASK = 0          # UNVERIFIED: which FLAGS bits mean "bad pixel". 0 = mask nothing, only report.
@@ -183,8 +190,7 @@ def _parse_detector(bandpass, uri) -> int | None:
         m = re.search(r"\d+D(\d)_spx", uri)
     return int(m.group(1)) if m else None
 
-
-def search_images(ra, dec, size_deg, detector=None) -> list[ImageRef]:
+def _search_tap(ra, dec, size_deg, detector=None) -> list[ImageRef]:
     """All SPHEREx exposures covering (ra, dec), oldest first.
 
     Uses the TAP query from IRSA's cutout tutorial. TAP sees new data right after the weekly
@@ -231,6 +237,68 @@ def search_images(ra, dec, size_deg, detector=None) -> list[ImageRef]:
     refs.sort(key=lambda r: r.mjd)
     return refs
 
+def _query_sia(collection: str, ra: float, dec: float):
+    """One SIA2 search with short retries. Returns an astropy Table."""
+    params = {"COLLECTION": collection, "POS": f"circle {ra:.8f} {dec:.8f} {SIA_RADIUS_DEG}"}
+    last_error = None
+    for _ in range(SIA_ATTEMPTS):
+        try:
+            response = requests.get(SIA_URL, params=params, timeout=60)
+            response.raise_for_status()
+            return parse_single_table(io.BytesIO(response.content)).to_table(use_names_over_ids=True)
+        except (requests.RequestException, ValueError) as exc:  # ValueError: HTML error page, not VOTable
+            last_error = exc
+            time.sleep(SIA_RETRY_DELAY_S)
+    raise UpstreamError(f"IRSA SIA2 query ({collection}) failed: {last_error}")
+
+
+def _search_sia2(ra, dec, size_deg, detector=None) -> list[ImageRef]:
+    """Backup search through IRSA's SIA2 service (used when TAP fails)."""
+    refs, seen, errors = [], set(), []
+    for collection in SIA_COLLECTIONS:
+        try:
+            table = _query_sia(collection, ra, dec)
+        except UpstreamError as exc:
+            errors.append(str(exc))
+            continue
+        log.info("SIA2 %s: %d images", collection, len(table))
+        for row in table:
+            mjd = float(row["t_min"])
+            if not np.isfinite(mjd):
+                continue
+            url = str(row["access_url"])
+            det = _parse_detector(row["energy_bandpassname"], url)
+            if detector and det != detector:
+                continue
+            key = (str(row["obs_id"]), det)  # same exposure in two collections: keep the first
+            if key in seen:
+                continue
+            seen.add(key)
+            rel = re.search(r"/spherex/([^/]+)/level2/", url)
+            refs.append(ImageRef(
+                uri=f"{url}?center={ra:.8f},{dec:.8f}d&size={size_deg:.6g}",
+                mjd=mjd,
+                detector=det,
+                release=rel.group(1) if rel else "unknown",
+                file_id=url.rsplit("/", 1)[-1],
+            ))
+    if not refs and errors:
+        raise UpstreamError("; ".join(errors))
+    refs.sort(key=lambda r: r.mjd)
+    return refs
+
+
+def search_images(ra, dec, size_deg, detector=None) -> list[ImageRef]:
+    """All SPHEREx exposures covering (ra, dec), oldest first. TAP first, SIA2 as backup."""
+    ra, dec, size_deg, detector = validate_request(ra, dec, size_deg, detector)
+    try:
+        return _search_tap(ra, dec, size_deg, detector)
+    except UpstreamError as tap_error:
+        log.warning("%s. Trying SIA2 backup.", tap_error)
+        try:
+            return _search_sia2(ra, dec, size_deg, detector)
+        except UpstreamError as sia_error:
+            raise UpstreamError(f"{tap_error} | {sia_error}") from sia_error
 
 # --------------------------------------------------------------------------- 2. cutouts
 def _read_cutout(ref: ImageRef, coord: SkyCoord) -> Cutout:

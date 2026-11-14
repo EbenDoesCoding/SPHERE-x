@@ -18,7 +18,7 @@ URL_BASE = "/demo/frames"  # demo_cache/ gets mounted at /demo in stage 9b
 SIZE_DEG = 0.05
 SIZE_ARCMIN = SIZE_DEG * 60  # Gaia query uses arcminutes
 ATTEMPTS = 10
-RETRY_DELAY_S = 30
+RETRY_DELAY_S = 10
 
 TARGETS = [
     {"slug": "barnards-star", "name": "Barnard's Star", "query": "Barnard's Star"},
