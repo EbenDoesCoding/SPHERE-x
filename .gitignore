@@ -218,3 +218,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Tombaugh (appended on dev) -------------------------------------------------------------------
+# The Python template above ignores lib/, build/, dist/, env/, var/ and similar names anywhere in the
+# tree. Web sources are never build output: keep everything under web/src tracked, whatever a folder
+# is called. The generated folder is ignored again below.
+!web/src/**
+
+# Local caches
+.cache/
+api/.cache/
+
+# Web: dependencies, build output, and the copies written by web/scripts/sync-contract.mjs
+web/node_modules/
+web/dist/
+web/public/fixtures/
+web/src/generated/
+
+# Local tool settings and OS files
+.claude/settings.local.json
+.DS_Store
