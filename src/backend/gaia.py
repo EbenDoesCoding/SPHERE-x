@@ -1,4 +1,7 @@
+#!/usr/bin/env python3
+
 import math
+import time
 
 import numpy as np
 from astroquery.gaia import Gaia
@@ -12,6 +15,16 @@ def _clean(value):
         return None
     return float(value)
 
+
+def _run_query(query: str, attempts: int = 3, delay: float = 3.0):
+    """Run a Gaia query, retrying on connection errors."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return Gaia.launch_job(query).get_results()
+        except (ConnectionError, OSError):
+            if attempt == attempts:
+                raise
+            time.sleep(delay)
 
 def get_stars(ra: float, dec: float, size: float) -> list[dict]:
     """Gaia DR3 stars around (ra, dec). size = cutout width in arcminutes."""
@@ -28,8 +41,7 @@ def get_stars(ra: float, dec: float, size: float) -> list[dict]:
         )
         ORDER BY phot_g_mean_mag ASC
     """
-    table = Gaia.launch_job(query).get_results()
-
+    table = _run_query(query)
     return [
         {
             "id": str(row["source_id"]),
