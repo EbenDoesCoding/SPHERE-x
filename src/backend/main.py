@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import threading
 from overlay import build_overlay
 from pathlib import Path
 from presets import DEMO_DIR, find_preset_frames, list_presets
@@ -15,6 +16,7 @@ from fastapi.responses import JSONResponse
 from gaia import get_stars
 from resolve import resolve
 import cache
+from cleanup import trim_live_frames
 
 app = FastAPI(title="SPHERE-X API")
 
@@ -32,6 +34,21 @@ DEMO_DIR.mkdir(exist_ok=True)
 app.mount("/demo", StaticFiles(directory=DEMO_DIR), name="demo")
 
 SPHEREX_STATUS = {"bad_request": 400, "no_coverage": 404, "upstream_error": 502}
+MAX_LIVE_BUILDS = 1
+live_build_slots = threading.BoundedSemaphore(MAX_LIVE_BUILDS)
+
+
+class ServerBusy(Exception):
+    """Raised when all live-build slots are taken."""
+
+
+@app.exception_handler(ServerBusy)
+async def server_busy_handler(request: Request, exc: ServerBusy):
+    return JSONResponse(
+        status_code=503,
+        content={"error": "Server busy building another request. Try again in a minute."},
+    )
+
 
 @app.exception_handler(SpherexError)
 async def spherex_error_handler(request: Request, exc: SpherexError):
@@ -72,7 +89,6 @@ def _get_stars(ra: float, dec: float, size_arcmin: float) -> list[dict]:
     cache.save("stars", ra, dec, size_arcmin, {"stars": stars})
     return stars
 
-
 def _get_frames(ra: float, dec: float, size: float, detector=None, mode="best", group_id=None) -> dict:
     # Presets were built with default options, so only use them for default requests
     if detector is None and mode == "best" and group_id is None:
@@ -88,14 +104,25 @@ def _get_frames(ra: float, dec: float, size: float, detector=None, mode="best", 
     if json_path.exists():
         return json.loads(json_path.read_text())
 
-    # image_url values are relative: the frontend must prepend the API base URL.
-    result = build_frames(
-        ra, dec, size, detector, out_dir, f"/static/frames/{folder}",
-        mode=mode, group_id=group_id,
-    )
-    json_path.write_text(json.dumps(result))
-    return result
+    # Live build: only a limited number at once, otherwise tell the user to retry
+    if not live_build_slots.acquire(blocking=False):
+        raise ServerBusy()
+    try:
+        # Another request may have finished this exact build while we were checking
+        if json_path.exists():
+            return json.loads(json_path.read_text())
 
+        # image_url values are relative: the frontend must prepend the API base URL.
+        result = build_frames(
+            ra, dec, size, detector, out_dir, f"/static/frames/{folder}",
+            mode=mode, group_id=group_id,
+        )
+        json_path.write_text(json.dumps(result))
+		json_path.write_text(json.dumps(result))
+        trim_live_frames()
+        return result
+    finally:
+        live_build_slots.release()
 
 @app.get("/stars")
 def stars_endpoint(ra: float, dec: float, size: float = 2.0):  # size in arcminutes
