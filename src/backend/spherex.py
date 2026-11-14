@@ -56,7 +56,7 @@ log = logging.getLogger("spherex")
 # astropy repeats warnings about alternate WCSs on every SPHEREx file (as in the IRSA notebook).
 logging.getLogger("astropy").setLevel(logging.ERROR)
 # Reading SPHEREx files can exceed astropy's default timeout (IRSA notebook raises it too).
-conf.remote_timeout = 120
+conf.remote_timeout = 30 
 
 # --------------------------------------------------------------------------- config
 IRSA_BASE = "https://irsa.ipac.caltech.edu/"

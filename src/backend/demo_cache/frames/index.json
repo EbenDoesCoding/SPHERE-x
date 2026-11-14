@@ -8,5 +8,45 @@
     "n_frames": 3,
     "n_epochs": 3,
     "n_stars": 43
+  },
+  "barnards-star": {
+    "slug": "barnards-star",
+    "name": "Barnard's Star",
+    "ra": 269.4520769586187,
+    "dec": 4.69336496657667,
+    "size_deg": 0.05,
+    "n_frames": 3,
+    "n_epochs": 3,
+    "n_stars": 200
+  },
+  "epsilon-indi-b": {
+    "slug": "epsilon-indi-b",
+    "name": "Epsilon Indi B",
+    "ra": 331.04414658852124,
+    "dec": -56.78284419511611,
+    "size_deg": 0.05,
+    "n_frames": 4,
+    "n_epochs": 3,
+    "n_stars": 39
+  },
+  "rw-aurigae": {
+    "slug": "rw-aurigae",
+    "name": "RW Aurigae",
+    "ra": 76.95652603458,
+    "dec": 30.40143817389,
+    "size_deg": 0.05,
+    "n_frames": 2,
+    "n_epochs": 2,
+    "n_stars": 122
+  },
+  "r-draconis": {
+    "slug": "r-draconis",
+    "name": "R Draconis",
+    "ra": 248.16761083295,
+    "dec": 66.75497941722,
+    "size_deg": 0.05,
+    "n_frames": 7,
+    "n_epochs": 5,
+    "n_stars": 29
   }
 }

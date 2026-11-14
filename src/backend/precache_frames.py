@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
-"""Precompute /frames and /stars for the 5 challenge targets into demo_cache/."""
+"""Precompute /frames and /stars for the 5 challenge targets into demo_cache/.
+
+Usage:
+    uv run python precache_frames.py                 # all targets not done yet
+    uv run python precache_frames.py wise-0855       # one target
+    uv run python precache_frames.py wise-0855 --force
+Each target runs in its own process with a hard time limit, so a stuck download cannot hang the script.
+"""
 import json
 import logging
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -14,11 +22,13 @@ from resolve import resolve
 from spherex import build_frames
 
 DEMO_FRAMES_DIR = Path(__file__).parent / "demo_cache" / "frames"
-URL_BASE = "/demo/frames"  # demo_cache/ gets mounted at /demo in stage 9b
+INDEX_PATH = DEMO_FRAMES_DIR / "index.json"
+URL_BASE = "/demo/frames"  # demo_cache/ is mounted at /demo in main.py
 SIZE_DEG = 0.05
 SIZE_ARCMIN = SIZE_DEG * 60  # Gaia query uses arcminutes
-ATTEMPTS = 10
-RETRY_DELAY_S = 10
+ATTEMPTS = 5
+RETRY_DELAY_S = 5
+TARGET_TIMEOUT_S = 900  # hard limit per target (15 minutes)
 
 TARGETS = [
     {"slug": "barnards-star", "name": "Barnard's Star", "query": "Barnard's Star"},
@@ -42,7 +52,7 @@ def with_retries(func, label: str):
         try:
             return func()
         except Exception as exc:
-            print(f"  {label}: attempt {attempt}/{ATTEMPTS} failed: {exc}")
+            print(f"  {label}: attempt {attempt}/{ATTEMPTS} failed: {exc}", flush=True)
             if attempt == ATTEMPTS:
                 raise
             time.sleep(RETRY_DELAY_S)
@@ -52,7 +62,7 @@ def process(target: dict) -> dict:
     slug = target["slug"]
     out_dir = DEMO_FRAMES_DIR / slug
     ra, dec = get_coords(target)
-    print(f"  coordinates: ra={ra:.5f} dec={dec:.5f}")
+    print(f"  coordinates: ra={ra:.5f} dec={dec:.5f}", flush=True)
 
     result = with_retries(
         lambda: build_frames(ra, dec, SIZE_DEG, None, out_dir, f"{URL_BASE}/{slug}"),
@@ -66,7 +76,7 @@ def process(target: dict) -> dict:
 
     n_epochs = len({f["epoch"] for f in result["frames"]})
     if n_epochs < 2:
-        print("  WARNING: fewer than 2 epochs, motion cannot be seen")
+        print("  WARNING: fewer than 2 epochs, motion cannot be seen", flush=True)
 
     return {
         "slug": slug,
@@ -80,15 +90,33 @@ def process(target: dict) -> dict:
     }
 
 
-def main():
+def run_worker(slug: str) -> int:
+    """Runs inside the child process: build one target and record it in index.json."""
+    target = next(t for t in TARGETS if t["slug"] == slug)
+    try:
+        info = process(target)
+    except Exception as exc:
+        print(f"FAIL {target['name']}: {exc}", flush=True)
+        return 1
+    DEMO_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    index = json.loads(INDEX_PATH.read_text()) if INDEX_PATH.exists() else {}
+    index[slug] = info
+    INDEX_PATH.write_text(json.dumps(index, indent=2))
+    print(f"OK   {target['name']}: {info['n_frames']} frames, "
+          f"{info['n_epochs']} epochs, {info['n_stars']} stars", flush=True)
+    return 0
+
+
+def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = sys.argv[1:]
+
+    if args and args[0] == "--worker":
+        sys.exit(run_worker(args[1]))
+
     force = "--force" in args
     wanted = [a for a in args if not a.startswith("--")]
-
-    DEMO_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-    index_path = DEMO_FRAMES_DIR / "index.json"
-    index = json.loads(index_path.read_text()) if index_path.exists() else {}
+    index = json.loads(INDEX_PATH.read_text()) if INDEX_PATH.exists() else {}
 
     for target in TARGETS:
         slug = target["slug"]
@@ -98,15 +126,14 @@ def main():
             print(f"SKIP {target['name']} (already done)")
             continue
 
-        print(f"START {target['name']}")
+        print(f"START {target['name']} (limit {TARGET_TIMEOUT_S // 60} min)", flush=True)
         try:
-            index[slug] = process(target)
-            index_path.write_text(json.dumps(index, indent=2))
-            info = index[slug]
-            print(f"OK   {target['name']}: {info['n_frames']} frames, "
-                  f"{info['n_epochs']} epochs, {info['n_stars']} stars")
-        except Exception as exc:
-            print(f"FAIL {target['name']}: {exc}")
+            subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--worker", slug],
+                timeout=TARGET_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"FAIL {target['name']}: timed out after {TARGET_TIMEOUT_S // 60} min, skipped", flush=True)
 
 
 if __name__ == "__main__":
