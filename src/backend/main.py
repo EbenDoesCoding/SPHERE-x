@@ -3,8 +3,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-
+from gaia import get_stars
 from resolve import resolve
+import cache
 
 app = FastAPI(title="SPHERE-X API")
 
@@ -28,3 +29,18 @@ def resolve_endpoint(q: str):
     except ValueError as e:
         return JSONResponse(status_code=404, content={"error": str(e)})
     return {"name": q, "ra": result["ra"], "dec": result["dec"]}
+
+@app.get("/stars")
+def stars_endpoint(ra: float, dec: float, size: float = 2.0):
+    cached = cache.load("stars", ra, dec, size)
+    if cached is not None:
+        return cached
+
+    try:
+        stars = get_stars(ra, dec, size)
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": f"Gaia query failed: {e}"})
+
+    result = {"stars": stars}
+    cache.save("stars", ra, dec, size, result)
+    return result
