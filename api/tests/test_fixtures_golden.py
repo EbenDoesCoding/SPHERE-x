@@ -1,14 +1,17 @@
 """Golden tests on the two recorded REAL fields in ``cache/fixtures`` (Contract v1.0, section 8).
 
 The fixtures are SPHEREx data as the production pipeline built them (``python -m tombaugh.tools.make_fixture``);
-nothing here is simulated. Displayed frames are formed exactly as the contract says a client forms them:
+nothing here is simulated. Since pipeline 0.3.0 each also holds five older-survey ("legacy") planes,
+AllWISE W1 and W2 and 2MASS J, H and Ks, after its SPHEREx planes (Contract section 5). Displayed frames are
+formed exactly as the contract says a client forms them:
 
     frame(t) = sum_b w_b P(t, b) / sum_b w_b      over the selected wave bins b with a finite pixel
     sigma    = sqrt(sum_b w_b^2 sigma_b^2) / sum_b w_b            with uniform weights, w_b = 1
 
 What these tests prove end to end: the frame file is the one the manifest describes; catalogue stars fall on
 the pixels the grid predicts (registration, orientation and pixel convention); the cold brown dwarf is there in
-the 4-5 micron frames and nowhere else to hide; Barnard's Star moves north between visits.
+the 4-5 micron frames and nowhere else to hide, and the 2010 W2 plane shows a source where it was in 2010 and
+none at the centre; Barnard's Star moves north between visits.
 """
 
 from __future__ import annotations
@@ -27,7 +30,8 @@ from tombaugh import presets
 from tombaugh.frames import decode_planes
 from tombaugh.grid import Grid, sky_to_pixel
 from tombaugh.models import Manifest
-from tombaugh.timebins import assign_time_bins
+from tombaugh.prepare import clipped_stats
+from tombaugh.timebins import assign_time_bins, mjd_to_date
 from tombaugh.tools import make_fixture
 
 FIXTURES_DIR = Path(__file__).resolve().parents[2] / "cache" / "fixtures"
@@ -37,6 +41,12 @@ STAR_SEARCH_RADIUS_PX = 6.0  # 18.5 arcsec: inside the 20 arcsec isolation of a 
 STAR_TOLERANCE_PX = 3.0
 CENTRE_TOLERANCE_PX = 3.0
 BARNARD_APERTURE_PX = 12.0
+# Contract section 5: missions and bands of the legacy planes, in the order they follow the SPHEREx planes
+LEGACY_PLANES = (("AllWISE", "W1"), ("AllWISE", "W2"), ("2MASS", "J"), ("2MASS", "H"), ("2MASS", "Ks"))
+# WISE 0855: the challenge's coordinates (08h55m10.831s -07d14m42.53s), where it was in 2010, and its place at
+# epoch_ref 2026.0, the centre of the recorded field
+WISE0855_2010 = (133.795129, -7.245147)
+WISE0855_2026 = (133.7598, -7.2422)
 
 
 class Field:
@@ -125,7 +135,7 @@ def test_manifest_is_a_complete_contract_manifest(field):
     )
     assert [w.model_dump() for w in manifest.wave_bins] == [w.model_dump() for w in presets.wave_bins()]
     assert manifest.provenance.data_dois == ["10.26131/IRSA678", "10.26131/IRSA662"]
-    assert manifest.provenance.pipeline_version == "0.2.0"
+    assert manifest.provenance.pipeline_version == "0.3.0"
     text = json.dumps(field.raw_manifest)
     local_folders = ["/" + name + "/" for name in ("Users", "home", "private")]
     assert (
@@ -135,19 +145,31 @@ def test_manifest_is_a_complete_contract_manifest(field):
 
 def test_planes_are_ordered_and_consistent_with_the_time_bins(field):
     manifest = field.manifest
-    order = [(p.time_bin, p.wave_bin) for p in manifest.planes]
+    science = [p for p in manifest.planes if p.kind == "sci"]
+    older = [p for p in manifest.planes if p.kind != "sci"]
+    assert manifest.planes == science + older  # Contract section 5: legacy planes follow every SPHEREx plane
+    order = [(p.time_bin, p.wave_bin) for p in science]
     assert order == sorted(set(order))
     wave_bins = {w.id: w for w in manifest.wave_bins}
     for index, plane in enumerate(manifest.planes):
         assert plane.index == index and plane.offset == index * 119 * 119 * 2
+        assert plane.lam_min - 0.02 <= plane.lam_eff <= plane.lam_max + 0.02
+        assert plane.n_exposures >= 1 and 0.0 < plane.sigma < 1.0
+        assert np.isfinite(field.planes[index]).any()
+    for plane in science:
         assert (plane.kind, plane.mission, plane.band) == ("sci", "SPHEREx", None)
         assert (plane.lam_min, plane.lam_max) == (
             wave_bins[plane.wave_bin].lam_min,
             wave_bins[plane.wave_bin].lam_max,
         )
-        assert plane.lam_min - 0.02 <= plane.lam_eff <= plane.lam_max + 0.02
-        assert plane.n_exposures >= 1 and 0.0 < plane.sigma < 1.0
-        assert np.isfinite(field.planes[index]).any()
+    # Contract section 5: each legacy plane has a mission and a band, in the band order W1, W2, J, H, Ks (a
+    # band that could not be made is left out), no time bin or wave bin, its own dates, "scaled" "field_stars"
+    named = [(p.mission, p.band) for p in older]
+    assert len(set(named)) == len(named) and named == [pair for pair in LEGACY_PLANES if pair in named]
+    for plane in older:
+        assert plane.kind == "legacy" and (plane.time_bin, plane.wave_bin) == (None, None)
+        assert plane.scaled == "field_stars"
+        assert plane.date_start <= mjd_to_date(plane.mjd_mid) <= plane.date_end
     assert [b.id for b in manifest.time_bins] == list(range(len(manifest.time_bins)))
     for time_bin in manifest.time_bins:
         mine = [p for p in manifest.planes if p.time_bin == time_bin.id]
@@ -199,6 +221,46 @@ def test_recorded_time_bins(wise0855, barnard):
         "newest_mjd": 61174.28788, "newest_date": "2026-05-14",
     }  # fmt: skip
     assert (barnard.manifest.exposures.found, barnard.manifest.exposures.used) == (364, 348)
+
+
+def test_recorded_legacy_planes(wise0855, barnard):
+    """The older-survey planes recorded on 14 Nov 2026 (pipeline 0.3.0): five bands per field, after its
+    SPHEREx planes, with the dates of the archive images and the field-star scaling the notes describe.
+    AllWISE W1 and W2 are coadds of the 2010 passes over the field; 2MASS J, H and Ks are from one night."""
+    recorded = {
+        "wise0855": [
+            ("AllWISE", "W1", "2010-05-03", "2010-11-13", 26),
+            ("AllWISE", "W2", "2010-05-03", "2010-11-13", 26),
+            ("2MASS", "J", "1998-12-28", "1998-12-28", 6),
+            ("2MASS", "H", "1998-12-28", "1998-12-28", 6),
+            ("2MASS", "Ks", "1998-12-28", "1998-12-28", 6),
+        ],
+        "barnard": [
+            ("AllWISE", "W1", "2010-03-18", "2010-09-19", 30),
+            ("AllWISE", "W2", "2010-03-18", "2010-09-19", 30),
+            ("2MASS", "J", "2000-05-28", "2000-05-28", 6),
+            ("2MASS", "H", "2000-05-28", "2000-05-28", 6),
+            ("2MASS", "Ks", "2000-05-28", "2000-05-28", 6),
+        ],
+    }
+    spherex_planes = {"wise0855": 68, "barnard": 82}
+    for field in (wise0855, barnard):
+        planes = field.manifest.planes
+        older = [p for p in planes if p.kind == "legacy"]
+        found = [(p.mission, p.band, p.date_start, p.date_end, p.n_exposures) for p in older]
+        assert found == recorded[field.name]
+        assert len(planes) == spherex_planes[field.name] + 5 and planes[-5:] == older
+        first_visit = field.manifest.time_bins[0].date_start
+        notes = field.manifest.provenance.notes
+        for plane in older:
+            assert plane.date_end < first_visit
+            label = f"{plane.mission} {plane.band}: "
+            assert any(n.startswith(label) and f"{plane.date_start} to {plane.date_end}" in n for n in notes)
+            assert any(n.startswith(label + "brightness matched to the paired SPHEREx frame") for n in notes)
+            data = field.planes[plane.index]
+            assert np.isfinite(data).all()  # the archive images cover the whole field
+            # sigma is the plane's own robust noise, on the scale of its values (measured: equal within 0.04%)
+            assert clipped_stats(data)[1] == pytest.approx(plane.sigma, rel=0.01)
 
 
 def test_exposures_left_out_for_the_foreground_at_1083_nm_are_accounted_for(wise0855, barnard):
@@ -306,15 +368,18 @@ def test_fixture_star_check_fails_on_a_mirrored_or_transposed_frame(field):
 
 
 # ----------------------------------------------------------------------------------------- WISE 0855
-def _local_maxima_near_centre(frame: np.ndarray, grid: Grid, radius: float) -> list[tuple[float, float]]:
-    """(value, distance from the centre in px) of every local maximum within `radius` px of the centre."""
+def _local_maxima_near(frame: np.ndarray, x: float, y: float, radius: float) -> list[tuple[float, float]]:
+    """(value, distance from (x, y) in px) of every local maximum within `radius` px of (x, y)."""
     filled = np.where(np.isfinite(frame), frame, -np.inf)
     peaks = (filled == ndimage.maximum_filter(filled, size=3, mode="nearest")) & np.isfinite(frame)
-    peaks &= _disc(frame.shape, grid.cx, grid.cy, radius)
+    peaks &= _disc(frame.shape, x, y, radius)
     rows, cols = np.nonzero(peaks)
-    return [
-        (float(frame[r, c]), math.hypot(c - grid.cx, r - grid.cy)) for r, c in zip(rows, cols, strict=True)
-    ]
+    return [(float(frame[r, c]), math.hypot(c - x, r - y)) for r, c in zip(rows, cols, strict=True)]
+
+
+def _local_maxima_near_centre(frame: np.ndarray, grid: Grid, radius: float) -> list[tuple[float, float]]:
+    """(value, distance from the centre in px) of every local maximum within `radius` px of the centre."""
+    return _local_maxima_near(frame, grid.cx, grid.cy, radius)
 
 
 def test_wise0855_is_at_the_centre_of_every_full_cold_frame(wise0855):
@@ -349,6 +414,28 @@ def test_wise0855_peaks_at_the_centre_only_in_the_cold_frames(wise0855):
         assert warm_peaks and all(distance > 1.5 for _, distance in warm_peaks)
 
 
+def test_wise0855_w2_plane_shows_a_source_at_the_2010_position_and_none_at_the_centre(wise0855):
+    """Then and Now on the recording. The AllWISE W2 plane (passes of 2010-05-03 to 2010-11-13) has a source
+    at the challenge's coordinates, where WISE 0855 was in 2010, about 127 arcsec east of the field centre,
+    and nothing comparable at the centre, where the SPHEREx 4-5 micron frames of 2025-26 show the dwarf (the
+    two tests above). Near the centre the 2010 plane peaks only on the catalogued background star about 2.2
+    px away (the "blended neighbour" of Contract section 8). The values in the comments were measured on this
+    recording."""
+    w2 = next(p for p in wise0855.manifest.planes if p.kind == "legacy" and p.band == "W2")
+    plane = wise0855.planes[w2.index]
+    then_x, then_y = (float(v) for v in sky_to_pixel(wise0855.grid, *WISE0855_2010))  # (17.97, 62.46)
+    now_x, now_y = (float(v) for v in sky_to_pixel(wise0855.grid, *WISE0855_2026))  # (59, 59)
+    then_value, then_offset = max(_local_maxima_near(plane, then_x, then_y, 2.0), default=(0.0, math.inf))
+    # measured: 0.207 MJy/sr, 30.3 times the plane's sigma (0.00682), at pixel (18, 62), 0.46 px away
+    assert then_value > 15.0 * w2.sigma and then_offset <= 1.5
+    # measured: no local maximum within 1.5 px of the centre (the nearest, the neighbour, is 2.24 px away at
+    # 8.8 sigma), and the brightest of the 3 x 3 pixels there is 6.8 sigma, 0.23 times the 2010 source
+    assert _local_maxima_near(plane, now_x, now_y, 1.5) == []
+    near_now = _disc(plane.shape, now_x, now_y, 1.5)
+    assert near_now.sum() == 9 and np.isfinite(plane[near_now]).all()
+    assert float(plane[near_now].max()) < then_value / 3.0
+
+
 # ---------------------------------------------------------------------------------------- Barnard's Star
 def _centroid_y(frame: np.ndarray, grid: Grid, radius: float) -> tuple[float, float]:
     """Flux-weighted centroid (x, y) of the finite pixels within `radius` px of the centre."""
@@ -378,14 +465,16 @@ def test_barnard_moves_north_between_the_first_and_last_full_time_bin(barnard):
 
 
 def test_barnard_core_is_saturated_and_says_so(barnard):
-    """The saturated core is NaN in the frame file (never zero), and the manifest warns about it."""
+    """The saturated core is NaN in the SPHEREx planes of the frame file (never zero), and the manifest warns
+    about it. The legacy planes do not show this core (in 2010 the star was about 161 arcsec south of the
+    centre, in 2000 off the field), and their single pixels of exactly 0.0 are values: the background median
+    subtracted (ENGINE_NOTES known limit 16)."""
     assert any("saturated core within 15 arcsec of the centre" in w for w in barnard.manifest.warnings)
     centre = _disc(barnard.grid.shape, barnard.grid.cx, barnard.grid.cy, 6.0)
-    blank = [int(np.isnan(plane[centre]).sum()) for plane in barnard.planes]
+    science = [barnard.planes[p.index] for p in barnard.manifest.planes if p.kind == "sci"]
+    blank = [int(np.isnan(plane[centre]).sum()) for plane in science]
     assert sum(count > 0 for count in blank) >= len(blank) // 4  # many planes have a blank core ...
-    assert all(
-        not (plane[centre] == 0.0).any() for plane in barnard.planes
-    )  # ... and none fakes it with zeros
+    assert all(not (plane[centre] == 0.0).any() for plane in science)  # ... and none fakes it with zeros
 
 
 # ------------------------------------------------------------------ how the fixtures are made (no network)
