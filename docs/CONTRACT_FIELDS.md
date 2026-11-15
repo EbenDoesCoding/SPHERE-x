@@ -264,6 +264,29 @@ Base path `/api`. All responses are JSON except `frames.bin`.
 
 The web app carries copies under `web/public/fixtures/` so the front end runs with no API. Golden tests assert: each `fixture_stars` entry maps to its recorded pixel within 0.5 px; `frames.bin` matches its `sha256`; WISE 0855's "cold" frame has a source within 2 px of the centre in the full visits; Barnard's centroid moves north between the first and last time bins.
 
+**Recorded answers** (clarified on 15 Nov 2026; the JSON of 7.1 and 7.3 is unchanged). A recorded field may also hold `overlays.json` and `spectrum.json`: the engine's real answers to `GET /api/fields/{key}/overlays` and to `GET /api/fields/{key}/spectrum` at the manifest's `request` position, for `{key}` the field's own key, written by `python -m tombaugh.tools.record_answers <name>` and never by hand. Both are optional: a recorded field without them is valid. Each file is one JSON object, compact, with one trailing newline:
+
+```jsonc
+{ "contract": "1.0", "kind": "recorded_answer",
+  "route": "spectrum",                          // "overlays" | "spectrum"
+  "field": "wise0855",                          // the recorded field's name
+  "key": "5c321dc84550bfba",                    // the manifest's key
+  "pipeline_version": "0.3.0",                  // the manifest's provenance.pipeline_version
+  "recorded_at": "2026-11-15T00:01:42Z",        // UTC
+  "request": { "ra": 133.7598, "dec": -7.2422 },  // {} for overlays; for a spectrum, the manifest's request
+  "response": { "contract": "1.0", "status": "ok", "state": "ok" /* … the route's body, byte for byte */ } }
+```
+
+Only a final answer is recorded: HTTP 200, a body of the contract's shape, for overlays both `upstreams` "ok", for a spectrum no `X-Tombaugh-Incomplete` header. A client uses a recorded answer under these rules:
+
+- **R1.** A recorded answer belongs to one recorded field. It is used only for a field whose manifest `key` equals the envelope's `key`, and only when `contract`, `kind`, `route` and `field` are as expected and `response` passes the same validation as a live answer.
+- **R2.** Live answers win. The client asks the engine first, as it does without recorded answers. A recorded answer is used only when no live answer can be had: the field itself came from the bundled copy (the engine is unreachable), or the request to the engine failed (network error, timeout, 404, 429, 5xx), or, for overlays only, the live answer marks an upstream `"unavailable"`.
+- **R3.** The recorded spectrum applies only while the selected position is the pixel of the envelope's `request` position (a recorded field's default selection). Anywhere else the client says what it says when no spectrum can be measured.
+- **R4.** A recorded answer on screen is always labelled as recorded, with the UTC date of `recorded_at`: once in the spectrum panel while a recorded spectrum is shown, and once among the caveats while recorded catalogue markers are drawn. Nothing may suggest that it is live.
+- **R5.** A missing file (404), or an envelope that fails R1, is not an error for the reader: the client behaves as it does when the field has no recorded answer.
+
+Golden tests (`api/tests/test_recorded_answers.py`) hold each file to its field: the envelope above, a response that is the contract model's own JSON with its recorded digest, overlays equal to what the engine computes offline from the catalogue answers kept in `api/tests/data/catalogs`, and a spectrum measured for what those overlays say at the request position.
+
 ## 9. Shared code interfaces
 
 - **Python** (`api/tombaugh/models.py`, pydantic): `Exposure`, `Cutout`, `TimeBin`, `WaveBin`, `Plane`, `Manifest`, `SpectrumResponse`, `ResolveResponse`, `OverlaysResponse`. These models are the source of truth; `docs/contract/manifest.schema.json` is exported from them.
