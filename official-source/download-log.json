@@ -1,0 +1,32 @@
+[
+  {
+    "file": "m101-may.fits",
+    "url": "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/level2/2025W20_2D/l2b-v27-2026-198/2/level2_2025W20_2D_0176_4D2_spx_l2b-v27-2026-198.fits?center=210.80227,54.34895d&size=0.3",
+    "status": 200,
+    "bytes": 4449600,
+    "seconds": 5.46
+  },
+  {
+    "file": "m101-dec.fits",
+    "url": "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/level2/2025W49_2A/l2b-v27-2026-209/2/level2_2025W49_2A_0426_2D2_spx_l2b-v27-2026-209.fits?center=210.80227,54.34895d&size=0.3",
+    "status": 200,
+    "bytes": 4449600
+  },
+  {
+    "file": "m101-june.fits",
+    "url": "https://irsa.ipac.caltech.edu/ibe/data/spherex/qr3/level2/2026W25_2A/l2b-v27-2026-273/2/level2_2026W25_2A_0279_1D2_spx_l2b-v27-2026-273.fits?center=210.80227,54.34895d&size=0.3",
+    "error": "('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))"
+  },
+  {
+    "file": "tutorial-figure.png",
+    "url": "https://caltech-ipac.github.io/irsa-tutorials/_public/4a2990c2668f392c5538e45e117da9b4.png",
+    "error": "('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))"
+  },
+  {
+    "file": "cloud-list.xml",
+    "url": "https://nasa-irsa-spherex.s3.us-east-1.amazonaws.com/?list-type=2&prefix=dr1/&delimiter=/&max-keys=10",
+    "status": 200,
+    "bytes": 1040,
+    "seconds": 0.77
+  }
+]
