@@ -39,6 +39,11 @@ export interface MarkersVM {
   status: "off" | "loading" | "ready" | "unavailable";
   /** Why markers are missing, written for the reader, or null. */
   note: string | null;
+  /**
+   * While the markers drawn come from a recorded answer, not a live one: the caveat that says so,
+   * with its date ("Catalogue markers were recorded on 14 Nov 2026."). Absent or null when live.
+   */
+  recorded?: string | null;
   /** Gaia DR3 stars at each frame's date: the open cross. */
   gaia: MarkerVM[];
   /** CatWISE neighbours: the diamond. */
@@ -102,6 +107,11 @@ export interface SpectrumVM {
   /** Binned points: drawn larger. */
   binned: SpectrumPointVM[];
   mode: "chart" | "table";
+  /**
+   * While the panel shows a recorded answer, not a live one: its chip, with the date it was
+   * recorded ("Recorded 14 Nov 2026"). Null otherwise.
+   */
+  recorded: string | null;
 }
 
 export interface ExtrasVM {

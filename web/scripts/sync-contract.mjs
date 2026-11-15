@@ -3,6 +3,11 @@
 //   docs/contract/presets.json  ->  web/src/generated/presets.json
 //   cache/fixtures/<name>/      ->  web/public/fixtures/<name>/
 //
+// A recorded field's folder is mirrored whole: its manifest.json and frames.bin, and the recorded
+// answers of the engine's routes when it has them (overlays.json, spectrum.json; both optional,
+// read by src/api.ts loadRecordedOverlays and loadRecordedSpectrum). A file or a folder the source
+// no longer has is removed from the copy.
+//
 // Runs before `dev`, `build` and `test` (see package.json). Both destinations are generated:
 // never edit them by hand. Paths are resolved from this file, so the working directory is free.
 import { copyFile, cp, mkdir, readdir, rm } from "node:fs/promises";
@@ -53,6 +58,9 @@ async function mirrorFolder(source, target) {
   }
 }
 
+/** The recorded answers a fixture folder carries: "overlays", "spectrum", both or none. */
+const RECORDED_ANSWERS = ["overlays", "spectrum"];
+
 async function syncFixtures() {
   const names = await listFolders(fixturesSource);
   await mkdir(fixturesTarget, { recursive: true });
@@ -61,16 +69,21 @@ async function syncFixtures() {
       await rm(join(fixturesTarget, stale), { recursive: true, force: true });
     }
   }
+  const copied = [];
   for (const name of names) {
-    await mirrorFolder(join(fixturesSource, name), join(fixturesTarget, name));
+    const target = join(fixturesTarget, name);
+    await mirrorFolder(join(fixturesSource, name), target);
+    const files = new Set(await listFiles(target));
+    const answers = RECORDED_ANSWERS.filter((route) => files.has(`${route}.json`));
+    copied.push(answers.length > 0 ? `${name} (recorded ${answers.join(" and ")})` : name);
   }
-  return names;
+  return copied;
 }
 
 try {
   await syncPresets();
-  const names = await syncFixtures();
-  const fixtures = names.length > 0 ? names.join(", ") : "none yet (cache/fixtures is empty)";
+  const copied = await syncFixtures();
+  const fixtures = copied.length > 0 ? copied.join(", ") : "none yet (cache/fixtures is empty)";
   console.log(`sync-contract: presets.json copied; fixtures: ${fixtures}`);
 } catch (error) {
   const where = error.path ? relative(repoDir, error.path) : "";

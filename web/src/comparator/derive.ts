@@ -6,7 +6,13 @@
 import { gridOf } from "../player/grid";
 import type { Limits } from "../player/render";
 import { type DifferenceFrame, differenceFrame, type Frame } from "../player/synth";
-import { deriveExtras, type OverlaysLoad, type SpectrumLoad } from "./extras/derive";
+import {
+  answersField,
+  deriveExtras,
+  type OverlaysLoad,
+  type RecordedLoads,
+  type SpectrumLoad,
+} from "./extras/derive";
 import { EMPTY_EXTRAS } from "./extras/empty";
 import { FEATURES, type Features } from "./features";
 import {
@@ -91,6 +97,8 @@ export interface Env {
   overlays?: OverlaysLoad;
   /** The spectrum at the ring, as loaded by the hook (extras). */
   spectrum?: SpectrumLoad;
+  /** The recorded answers of the field on screen, as loaded by the hook (extras); absent: none. */
+  recorded?: RecordedLoads;
 }
 
 export type Derived = Omit<ViewModel, "state" | "dispatch" | "patch" | "handlers">;
@@ -338,6 +346,8 @@ export function deriveView(
             grid: fieldVM.grid,
             band: fieldVM.band,
             sequence: fieldVM.sequence,
+            // Recorded answers: only for a recorded field opened for itself, never a stand-in.
+            recorded: answersField(state),
           }
         : null,
     source: fieldVM?.source ?? null,
@@ -347,6 +357,7 @@ export function deriveView(
         : null,
     overlays: env.overlays ?? { phase: "idle" },
     spectrum: env.spectrum ?? { phase: "idle" },
+    recorded: env.recorded,
   });
   const then = extras.thenAndNow;
   const image: ImageVM = {

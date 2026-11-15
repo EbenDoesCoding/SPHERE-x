@@ -182,11 +182,11 @@ export function spectrumModel(
   };
 }
 
-/** The panel's view of a model. */
+/** The panel's view of a model (whether the answer is live or recorded is the caller's to say). */
 export function spectrumVM(
   model: SpectrumModel,
   mode: SpectrumVM["mode"],
-): Omit<SpectrumVM, "open"> {
+): Omit<SpectrumVM, "open" | "recorded"> {
   const point = (row: SpectrumRow): SpectrumPointVM => ({
     lam: row.lam,
     flux: row.flux,
@@ -247,8 +247,13 @@ export function spectrumCsv(model: SpectrumModel): string {
   return `${lines.join("\n")}\n`;
 }
 
-/** "tombaugh-spectrum-133.75977_-7.24183.csv" */
-export function spectrumFileName(model: SpectrumModel): string {
+/**
+ * "tombaugh-spectrum-133.75977_-7.24183.csv"; a recorded answer's file says so in its name, with
+ * the UTC date it was recorded: "tombaugh-spectrum-133.75977_-7.24218-recorded-2026-11-14.csv".
+ * The rows are the same either way.
+ */
+export function spectrumFileName(model: SpectrumModel, recordedAt: string | null = null): string {
   const { ra, dec } = model.target;
-  return `tombaugh-spectrum-${ra.toFixed(5)}_${dec.toFixed(5)}.csv`;
+  const recorded = recordedAt ? `-recorded-${recordedAt.slice(0, 10)}` : "";
+  return `tombaugh-spectrum-${ra.toFixed(5)}_${dec.toFixed(5)}${recorded}.csv`;
 }

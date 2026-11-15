@@ -12,7 +12,8 @@
  * - The address bar (history.replaceState, never while playing) and Copy link.
  * - The extras (extras/derive.ts): the catalogue overlays of the field on screen while markers
  *   are on, and the spectrum at the ring while its panel is open, each aborted when what it was
- *   asked for changes; the handlers of vm.extras.
+ *   asked for changes; the recorded answers of a recorded field, asked for only when the rules of
+ *   extras/derive.ts call for them; the handlers of vm.extras.
  */
 import {
   type FocusEvent,
@@ -33,8 +34,12 @@ import {
   loadBundledField,
   loadField,
   loadOverlays,
+  loadRecordedOverlays,
+  loadRecordedSpectrum,
   loadSpectrum,
   loadStatus,
+  type RecordedAnswer,
+  type RecordedRoute,
 } from "../api";
 import { nameKey } from "../overlays/known-movers";
 import { readAsMessage } from "../overlays/messages";
@@ -49,12 +54,17 @@ import { ChangeGate, clampFps } from "../player/playback";
 import { FieldSynth } from "../player/synth";
 import { deriveView } from "./derive";
 import {
+  answersField,
   modelOf,
   type OverlaysLoad,
+  type RecordedField,
+  type RecordedLoad,
+  type RecordedLoads,
+  recordedNeeded,
   type SpectrumAt,
   type SpectrumLoad,
-  sameAt,
   spectrumAt,
+  spectrumShown,
 } from "./extras/derive";
 import { spectrumCsv, spectrumFileName } from "./extras/spectrum";
 import type { ExtrasVM } from "./extras/types";
@@ -667,23 +677,99 @@ export function useComparator(): ViewModel {
     };
   }, [wantedKey]);
 
+  // Recorded answers of a recorded field (extras/derive.ts, rules R1 to R5): read from the site's
+  // own copy only when the rules call for one, that is when no live answer can be had, and never
+  // for a recorded field shown instead of the place asked for (answersField). Each is read once
+  // per field and route, and kept for the page's life (a missing file stays missing); a file that
+  // could not be read this time counts as none until it is called for again, then is asked again.
+  const recordedField: RecordedField | null = shownField
+    ? {
+        manifest: shownField.manifest,
+        grid: gridOf(shownField.manifest),
+        recorded: answersField(state),
+        source: shownField.source,
+      }
+    : null;
+  const needed = recordedNeeded(state, FEATURES, recordedField, overlays, spectrum);
+  const [recordedAnswers, setRecordedAnswers] = useState<
+    ReadonlyMap<string, RecordedAnswer | null>
+  >(() => new Map());
+  const recordedAsked = useRef(new Set<string>());
+  const recordedId = (route: RecordedRoute) =>
+    recordedField?.recorded
+      ? `${route}|${recordedField.recorded}|${recordedField.manifest.key}`
+      : "";
+  const recordedWanted = [
+    needed.overlays ? recordedId("overlays") : "",
+    needed.spectrum ? recordedId("spectrum") : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  useEffect(() => {
+    for (const id of recordedWanted.split(" ")) {
+      if (id === "" || recordedAsked.current.has(id)) continue;
+      recordedAsked.current.add(id);
+      const [route, name, key] = id.split("|");
+      const load = route === "overlays" ? loadRecordedOverlays : loadRecordedSpectrum;
+      const keep = (answer: RecordedAnswer | null) =>
+        setRecordedAnswers((kept) => new Map(kept).set(id, answer));
+      // A small file of the site's own: never aborted. It resolves to null when there is no
+      // usable answer (R5). It rejects when the site did not answer this time (no answer, 429 or
+      // 5xx): the page then behaves as without the file, and the next time the file is called
+      // for (markers on again, the ring back, the field opened again) it is asked for again.
+      load(name, key).then(keep, () => {
+        recordedAsked.current.delete(id);
+        keep(null);
+      });
+    }
+  }, [recordedWanted]);
+  const recordedLoad = <R extends RecordedRoute>(route: R, need: boolean): RecordedLoad<R> => {
+    const name = recordedField?.recorded ?? null;
+    if (recordedField === null || name === null) return { phase: "idle" };
+    const key = recordedField.manifest.key;
+    const id = recordedId(route);
+    if (recordedAnswers.has(id)) {
+      const answer = (recordedAnswers.get(id) ?? null) as RecordedAnswer<R> | null;
+      return { phase: "done", field: name, key, answer };
+    }
+    // Asked for and not answered yet (or about to be asked, by the effect above).
+    return need ? { phase: "loading", field: name, key } : { phase: "idle" };
+  };
+  const recorded: RecordedLoads = {
+    overlays: recordedLoad("overlays", needed.overlays),
+    spectrum: recordedLoad("spectrum", needed.spectrum),
+  };
+  const recordedRef = useRef<RecordedLoads>(recorded);
+  recordedRef.current = recorded;
+
   const extrasHandlers = useMemo(
     (): ExtrasVM["handlers"] => ({
       toggleSpectrum: () => dispatch({ type: "setSpectrum", open: !stateRef.current.spectrum }),
       setSpectrumMode: (mode) => dispatch({ type: "setSpectrumMode", mode }),
       downloadCsv: () => {
-        const field = fieldOf(stateRef.current);
-        const load = spectrumRef.current;
-        if (!field || load.phase !== "ready") return;
-        const at = spectrumAt(field.manifest, gridOf(field.manifest), stateRef.current.ring);
-        if (!sameAt(load.at, at)) return;
-        const model = modelOf(load.data, field.manifest);
+        const s = stateRef.current;
+        const field = fieldOf(s);
+        if (!field) return;
+        // Exactly what the panel shows: the live answer, or the recorded one where it stands in.
+        const shown = spectrumShown({
+          field: {
+            manifest: field.manifest,
+            grid: gridOf(field.manifest),
+            recorded: answersField(s),
+            source: field.source,
+          },
+          ring: s.ring,
+          spectrum: spectrumRef.current,
+          recorded: recordedRef.current.spectrum,
+        });
+        if (shown.kind !== "answer") return;
+        const model = modelOf(shown.data, field.manifest);
         if (model.rows.length === 0) return;
         const blob = new Blob([spectrumCsv(model)], { type: "text/csv;charset=utf-8" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
-        link.download = spectrumFileName(model);
+        link.download = spectrumFileName(model, shown.recorded?.recorded_at ?? null);
         link.rel = "noopener";
         document.body.append(link);
         link.click();
@@ -858,6 +944,7 @@ export function useComparator(): ViewModel {
       searchHint: SEARCH_HINT,
       overlays,
       spectrum,
+      recorded,
     },
     FEATURES,
   );

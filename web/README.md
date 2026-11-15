@@ -24,18 +24,42 @@ reader starts it, nothing around the image moves, tokens and `bc-` classes only.
   `usePrefersReducedMotion`). The first viewer (`App.tsx`, `Player.tsx`, `Viewport.tsx`) is deleted.
 - `design/`: `tokens.css`, `components.css` (the `bc-` classes, copied from the design system's bundle),
   `icons.tsx`.
-- `api.ts` loads a field from the frames engine and falls back to the bundled recorded fields;
-  `contract.ts` holds the types of the engine's contract (`../docs/CONTRACT_FIELDS.md`); `site.ts` holds the
-  name, the comparator path and the repository address.
+- `api.ts` loads a field from the frames engine and falls back to the bundled recorded fields, and
+  reads their recorded answers (below, type `RecordedAnswer`); `contract.ts` holds the types of the
+  engine's contract (`../docs/CONTRACT_FIELDS.md`); `site.ts` holds the name, the comparator path and the
+  repository address.
 
 Also here: `functions/api/[[path]].ts` (a Cloudflare Pages Function that forwards `/api` to the engine),
 `vercel.example.json` (the same for Vercel), `public/fonts/` (self-hosted fonts with their licences).
 
+## Without the engine
+
+With no engine answering (none configured, or it does not respond), the page still shows the two
+recorded fields, WISE 0855 and Barnard's Star, from the copies bundled with the site: every frame,
+band and view (Blink, Side by side, Difference, Then and now, three-colour). Each recorded field also
+carries real answers of the engine's catalogue and spectrum routes, recorded beside it
+(`overlays.json`, `spectrum.json`; both optional). They stand in only where no live answer can be
+had, and are always labelled with the date they were recorded ([date] below: the UTC date of the
+file's `recorded_at`, written as the page writes one date, such as 15 Nov 2026):
+
+- Catalogue markers (Gaia DR3 and CatWISE, with WISE 0855's track): drawn from the recorded answer,
+  with the caveat "Catalogue markers were recorded on [date]."
+- The spectrum: at the field's own position only, the default ring (WISE 0855 measured; Barnard's
+  Star "Saturated: no reliable brightness"), with the chip "Recorded [date]". Anywhere else in the
+  field the panel says the spectrum cannot be measured while the archive is not responding.
+
+Everything else needs the engine: any other position, field of view or spectrum. A recorded field
+shown instead of another position that was asked for ("Showing the recorded field instead.") uses
+no recorded answer, so nothing it shows reads as an answer for that position. With the engine
+answering, the live answers are shown and the recorded files are not even requested; they also
+stand in when one of its requests fails. The rules are in `src/comparator/CONTRACT.md`, section 8.
+
 ## Generated folders: never edit or commit
 
 `src/generated/` and `public/fixtures/` are written by `scripts/sync-contract.mjs` from
-`../docs/contract/presets.json` and `../cache/fixtures/`, before every `npm run dev`, `npm run build` and
-`npm test`. Change the sources instead and run `npm run sync`. `dist/` is the build output.
+`../docs/contract/presets.json` and `../cache/fixtures/` (each recorded field's manifest, frame file
+and recorded answers), before every `npm run dev`, `npm run build` and `npm test`. Change the sources
+instead and run `npm run sync`. `dist/` is the build output.
 
 ## Commands
 

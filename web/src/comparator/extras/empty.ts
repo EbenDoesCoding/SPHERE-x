@@ -13,6 +13,7 @@ export const EMPTY_EXTRAS: ExtrasVM = {
     points: [],
     binned: [],
     mode: "chart",
+    recorded: null,
   },
   handlers: { toggleSpectrum() {}, setSpectrumMode() {}, downloadCsv() {} },
 };

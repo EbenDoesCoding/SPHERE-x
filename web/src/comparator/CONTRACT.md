@@ -176,7 +176,8 @@ the default band. Tests check both states through `withFeatures`.
   `spot`, `spec` (url.ts), written with `replaceState` a moment after a change, never while
   playing. Copy link writes the address first, then copies it.
 - Extras: the catalogue overlays of the field on screen while Markers is on, and the spectrum at
-  the ring while its panel is open, each aborted when what it was asked for changes (section 8).
+  the ring while its panel is open, each aborted when what it was asked for changes; a recorded
+  field's recorded answers, read only when no live answer can be had (section 8).
 
 ## 8. The four extras (vm.extras; extras/types.ts, extras/derive.ts)
 
@@ -192,7 +193,7 @@ without a real position; a missing value is left out with a plain sentence.
 
 State added for these: `spectrum` (panel open; kept by Recentre, a new field of view and the
 jump; closed by any other `go`) and `spectrumMode`, with the actions `setSpectrum` and
-`setSpectrumMode`. Env added: `overlays` and `spectrum` (what the hook has loaded).
+`setSpectrumMode`. Env added: `overlays`, `spectrum` and `recorded` (what the hook has loaded).
 
 SpectrumPanel: Main.dc.html 424–498 and Phone.dc.html 310–384. At 1280 it takes the place of
 Band, Field of view and Display in the view rail; at 1440 Band stays; on a phone and in the rail
@@ -200,3 +201,62 @@ layout's column it sits under the playback. The chart is extras/chart.ts (bundle
 ported): flux in µJy against 0.75 to 5.0 µm, one series colour and shape per visit, larger binned
 points, hollow flagged points; the flux axis follows the data and always includes zero. No
 example values are ever drawn.
+
+### Recorded answers (markers and spectrum with no engine)
+
+A recorded field may carry real answers of the engine's two routes, recorded beside it:
+`cache/fixtures/<name>/overlays.json` and `spectrum.json` (both optional; one envelope each:
+`contract`, `kind` "recorded_answer", `route`, `field`, `key`, `pipeline_version`, `recorded_at`,
+`request`, `response`; the type is `RecordedAnswer` in `src/api.ts`, kept out of the shared
+`src/contract.ts` until the contract's owner takes the envelope in). `scripts/sync-contract.mjs`
+copies them to `public/fixtures/<name>/`; `loadRecordedOverlays` and `loadRecordedSpectrum`
+(`src/api.ts`) read them from the page's own origin and give `null` for anything that fails R1.
+The rules are in `extras/derive.ts` ("Recorded answers"); the hook asks for a file only when
+`recordedNeeded` says the rules call for it.
+
+- **R1** An answer is used only for the recorded field of its name whose manifest key is its key,
+  with contract 1.x, kind, route and field as expected and a response that passes the live
+  loader's checks. Those checks hold every field of 7.1 and 7.3 with its type, as the engine's
+  models write them (a target with its position, method, neighbours, a time span or null, every
+  point and binned value; every source with its id, position and epoch, every track point, both
+  upstream states): an answer missing any of them is refused whole, live ("bad_response") or
+  recorded (null). A recorded spectrum is used only when its `request` is the manifest's request
+  position, as the format says it is.
+- **R2** Live answers win. A recorded answer is used only when no live one can be had: the field
+  is the bundled copy (a live answer the hook still holds for its key, from before the engine went
+  away, does not count), the engine's request failed (network error, timeout, 404, 429, 5xx; not
+  a 400 or an answer that breaks the contract), or, for the overlays only, the live answer marks a
+  catalogue "unavailable" (then only when the recorded answer has every catalogue the live one
+  has, and more). And only for a recorded field opened for itself (`answersField`): a recorded
+  field shown instead of the place asked for ("Showing the recorded field instead.") uses none, as
+  before recorded answers, so its markers and spectrum never read as those of the place asked for
+  (and the caveat that would label them cannot fall below the 1280 rail's edge under that notice
+  and a mover banner).
+- **R3** The recorded spectrum is used only while the ring is on the pixel of the envelope's
+  `request` position (a recorded field's default ring). One pixel away the panel says what it
+  says today ("The spectrum cannot be measured while the archive is not responding." for the
+  bundled copy); Recentre opens the recorded field again and brings it back.
+- **R4** Whatever comes from a recorded answer is labelled, with the UTC date of `recorded_at` in
+  the page's one-date form (`shortDate`, "15 Nov 2026"): `vm.extras.markers.recorded`, one caveat
+  sentence in place of "Catalogue markers are off while the archive is not responding." (the
+  Caveats block lists it, `time/rail.ts` caveatList; the legend does not repeat it), and
+  `vm.extras.spectrum.recorded`, the qualifier chip (dashed, empty mark, as the header's
+  "Recorded field") at the end of the Download CSV row, the one place in the panel where it costs
+  no height (the 1280 × 720 view rail stays 688 of 688 px with the chart open). The CSV holds
+  exactly the rows shown, as for a live answer; its file name ends in `-recorded-<date>`.
+- **R5** No file, or an envelope that fails R1: the page behaves as it does without recorded
+  answers. While a needed file is on its way the markers are "loading" and the panel shows no
+  sentence (nothing is being measured). A file the site did not serve this time (no answer after
+  three attempts, 429 or 5xx) counts as none too, and is asked for again the next time the rules
+  call for it (markers on again, the ring back, the field opened again). On a phone and in the
+  rail layout the caveat block is mounted whenever its list has a sentence
+  (`time/rail.ts` columnHasNotices), so the R4 sentence shows even for a field with no caveat of
+  its own.
+
+New copy (no board has it). [date] is a slot, as in Handoff-copy: the UTC date of the file's
+`recorded_at`, written as the page writes one date (15 Nov 2026 for the recordings of that day).
+
+| String                                     | Where and when                                                                          |
+| ------------------------------------------ | --------------------------------------------------------------------------------------- |
+| Catalogue markers were recorded on [date]. | Caveat list, while markers from a recorded answer are drawn                             |
+| Recorded [date]                            | Chip at the end of the spectrum panel's Download CSV row, while it shows such an answer |

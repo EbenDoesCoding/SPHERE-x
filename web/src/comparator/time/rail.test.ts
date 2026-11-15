@@ -6,6 +6,7 @@ import { readLink, writeLink } from "../url";
 import {
   CAVEATS_CUT,
   caveatList,
+  columnHasNotices,
   isColumn,
   isCut,
   isThreeColumns,
@@ -232,6 +233,48 @@ describe("caveatList", () => {
   it("adds why the catalogue markers are missing", () => {
     const extras = withExtras({ status: "unavailable", note: "Gaia could not be reached." }, {});
     expect(caveatList(barnard, extras, on)).toEqual([...barnard, "Gaia could not be reached."]);
+  });
+
+  it("says once that the markers drawn were recorded, only while they are drawn", () => {
+    // The extras lane writes the sentence with the recording's date; this one is a stand-in.
+    const synthetic_recorded = "Catalogue markers were recorded on 1 Jan 2000.";
+    const drawn = withExtras({ status: "ready", note: null, recorded: synthetic_recorded }, {});
+    expect(caveatList(barnard, drawn, on)).toEqual([...barnard, synthetic_recorded]);
+    const withNote = withExtras(
+      { status: "ready", note: "Gaia could not be reached.", recorded: synthetic_recorded },
+      {},
+    );
+    expect(caveatList(barnard, withNote, on)).toEqual([
+      ...barnard,
+      synthetic_recorded,
+      "Gaia could not be reached.",
+    ]);
+    for (const status of ["off", "loading", "unavailable"] as const) {
+      const notDrawn = withExtras({ status, note: null, recorded: synthetic_recorded }, {});
+      expect(caveatList(barnard, notDrawn, on)).toEqual(barnard);
+    }
+    expect(caveatList(barnard, drawn, { ...on, catalogueMarkers: false })).toEqual(barnard);
+    expect(caveatList(barnard, drawn, { ...on, onScreen: false })).toEqual(barnard);
+  });
+
+  it("holds the phone's notices for a field with no caveat of its own but its markers' sentence", () => {
+    // Comparator's Column mounts the caveat list only when this says so: the recorded markers'
+    // sentence (R4), or why markers are missing, must not be lost with no caveat of the field's.
+    const synthetic_recorded = "Catalogue markers were recorded on 1 Jan 2000.";
+    const drawn = withExtras({ status: "ready", note: null, recorded: synthetic_recorded }, {});
+    const missing = withExtras({ status: "unavailable", note: "Gaia could not be reached." }, {});
+    const quiet = withExtras({ status: "ready", note: null }, {});
+    const none = { mover: null, caveats: [] };
+    expect(columnHasNotices(none, drawn, on)).toBe(true);
+    expect(columnHasNotices(none, missing, on)).toBe(true);
+    expect(columnHasNotices(none, quiet, on)).toBe(false);
+    expect(columnHasNotices(none, drawn, { ...on, catalogueMarkers: false })).toBe(false);
+    expect(columnHasNotices({ mover: null, caveats: barnard }, quiet, on)).toBe(true);
+    const stays = { sentence: "Moved.", canJump: false };
+    expect(columnHasNotices({ mover: stays, caveats: [] }, quiet, on)).toBe(true);
+    expect(columnHasNotices({ mover: { ...stays, canJump: true }, caveats: [] }, quiet, on)).toBe(
+      false,
+    );
   });
 
   it("leaves out markers the reader hid, markers still loading, and the flag's absence", () => {

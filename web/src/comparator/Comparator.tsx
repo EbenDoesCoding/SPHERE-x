@@ -35,6 +35,7 @@ import { Targets } from "./blocks/Targets";
 import { Timeline } from "./blocks/Timeline";
 import { TitleStrip } from "./blocks/TitleStrip";
 import { ViewSwitch } from "./blocks/ViewSwitch";
+import { columnHasNotices } from "./time/rail";
 import { useComparator } from "./useComparator";
 import type { ViewModel } from "./vm";
 
@@ -157,7 +158,10 @@ function ViewRailGroups({ vm, withSpectrum = false }: { vm: ViewModel; withSpect
 /** The phone column (Plan-390). With `withRailGroups` false, the rail layout's column. */
 function Column({ vm, withRailGroups }: { vm: ViewModel; withRailGroups: boolean }) {
   const mover = vm.notices.mover;
-  const notices = (mover !== null && !mover.canJump) || vm.notices.caveats.length > 0;
+  const notices = columnHasNotices(vm.notices, vm.extras, {
+    onScreen: vm.field !== null,
+    catalogueMarkers: vm.features.catalogueMarkers,
+  });
   return (
     <div className="cmp-col" ref={vm.handlers.measureColumn}>
       <Slot name="header">

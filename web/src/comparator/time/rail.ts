@@ -5,7 +5,7 @@
 import type { ExtrasVM, ThenAndNowVM } from "../extras/types";
 import type { Layout } from "../geometry";
 import { type TargetId, targetById, targetPosition } from "../model";
-import type { PlaybackVM } from "../vm";
+import type { NoticesVM, PlaybackVM } from "../vm";
 
 /** 1280 and 1440: the time rail of three columns. */
 export function isThreeColumns(layout: Layout): boolean {
@@ -145,7 +145,8 @@ export function opensInPlace(click: {
 
 /**
  * Every sentence of the caveat list (CaveatList card), each once: the field's own caveats (the
- * manifest's warnings, written with dates), then why catalogue markers are missing. Transient
+ * manifest's warnings, written with dates), then why catalogue markers are missing, or, while the
+ * markers drawn come from a recorded answer, the sentence that says so with its date. Transient
  * states (loading, markers the reader hid) are not caveats and never enter the list.
  *
  * What the engine says about the spectrum at the ring stays in the spectrum panel, which prints
@@ -161,13 +162,11 @@ export function caveatList(
   },
 ): string[] {
   const out: string[] = [...field];
-  if (options.onScreen) {
+  // Recorded markers say so once, where the sentence for missing markers would stand (R4).
+  if (options.onScreen && options.catalogueMarkers) {
     const markers = extras.markers;
-    if (
-      options.catalogueMarkers &&
-      markers.note !== null &&
-      (markers.status === "ready" || markers.status === "unavailable")
-    ) {
+    if (markers.recorded && markers.status === "ready") out.push(markers.recorded);
+    if (markers.note !== null && (markers.status === "ready" || markers.status === "unavailable")) {
       out.push(markers.note);
     }
   }
@@ -180,6 +179,21 @@ export function caveatList(
     list.push(text);
   }
   return list;
+}
+
+/**
+ * Whether the phone and rail columns hold their notices block under the playback (Comparator
+ * Column): for a mover notice that cannot jump, or for any sentence of the caveat list as the
+ * Caveats block writes it, the field's own or the markers'. A field with no caveat of its own
+ * still says why its markers are missing, or that the markers drawn were recorded (R4).
+ */
+export function columnHasNotices(
+  notices: Pick<NoticesVM, "mover" | "caveats">,
+  extras: Pick<ExtrasVM, "markers">,
+  options: { onScreen: boolean; catalogueMarkers: boolean },
+): boolean {
+  if (notices.mover !== null && !notices.mover.canJump) return true;
+  return caveatList(notices.caveats, extras, options).length > 0;
 }
 
 /**

@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   checkFrames,
@@ -12,9 +15,12 @@ import {
   loadBundledField,
   loadField,
   loadOverlays,
+  loadRecordedOverlays,
+  loadRecordedSpectrum,
   loadSpectrum,
   loadStatus,
   type MeasureProgress,
+  type RecordedAnswer,
   spectrumUrl,
 } from "./api";
 import type { Manifest } from "./contract";
@@ -812,3 +818,258 @@ describe("where a frame file may come from", () => {
     expect(urls).toEqual(["https://engine.example/api/fields?ra=10&dec=20&fov=6"]);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Recorded answers: the real files shipped with the recorded fields (public/fixtures, copied from
+// cache/fixtures by scripts/sync-contract.mjs). The variants that must be refused are stand-ins
+// made from them, named synthetic_*.
+// ---------------------------------------------------------------------------------------------
+
+const fixturesDir = fileURLToPath(new URL("../public/fixtures/", import.meta.url));
+
+/** A recorded field's manifest key and its two recorded answers as text, or null when not bundled. */
+function recordedFiles(name: string) {
+  const read = (file: string) => {
+    const path = join(fixturesDir, name, file);
+    return existsSync(path) ? readFileSync(path, "utf8") : null;
+  };
+  const manifest = read("manifest.json");
+  const overlays = read("overlays.json");
+  const spectrum = read("spectrum.json");
+  if (manifest === null || overlays === null || spectrum === null) return null;
+  return { name, key: (JSON.parse(manifest) as Manifest).key, overlays, spectrum };
+}
+
+const wiseFiles = recordedFiles("wise0855");
+const barnardFiles = recordedFiles("barnard");
+
+/** A file as a static host serves it. */
+const served = (text: string, status = 200) =>
+  new Response(text, { status, headers: { "Content-Type": "application/json" } });
+
+/** A recorded answer's text with some of its envelope's fields changed: a stand-in, not real. */
+const synthetic_envelope = (text: string, change: Record<string, unknown>) =>
+  JSON.stringify({ ...JSON.parse(text), ...change });
+
+// Parsed JSON, read as objects, for making stand-ins of real answers.
+type Obj = Record<string, unknown>;
+const obj = (value: unknown) => value as Obj;
+const objs = (value: unknown) => value as Array<Obj | null>;
+/** Takes `name` out of a JSON object. */
+const drop = (value: unknown, name: string) => {
+  Reflect.deleteProperty(obj(value), name);
+};
+/** Sets `name` (a point's quality, unless named) of a JSON object to `text`. */
+const put = (value: unknown, text: string, name = "quality") => {
+  obj(value)[name] = text;
+};
+
+describe.skipIf(wiseFiles === null || barnardFiles === null)(
+  "loadRecordedOverlays and loadRecordedSpectrum",
+  () => {
+    type Files = NonNullable<typeof wiseFiles>;
+    const wise = () => wiseFiles as Files;
+    const barnard = () => barnardFiles as Files;
+
+    /** Serves `text` as every file asked for. */
+    const serving = (text: string, status = 200) => harness(() => served(text, status));
+
+    it("reads both answers of each recorded field from the site's own folder, as they are", async () => {
+      for (const files of [wise(), barnard()]) {
+        const { urls, options } = harness((url) =>
+          served(url.endsWith("/overlays.json") ? files.overlays : files.spectrum),
+        );
+        const overlays = await loadRecordedOverlays(files.name, files.key, options);
+        const spectrum = await loadRecordedSpectrum(files.name, files.key, options);
+        // Same origin, static files: never the engine.
+        expect(urls).toEqual([
+          `/fixtures/${files.name}/overlays.json`,
+          `/fixtures/${files.name}/spectrum.json`,
+        ]);
+        expect(overlays).toEqual(JSON.parse(files.overlays) as RecordedAnswer<"overlays">);
+        expect(spectrum).toEqual(JSON.parse(files.spectrum) as RecordedAnswer<"spectrum">);
+        expect([overlays?.route, spectrum?.route]).toEqual(["overlays", "spectrum"]);
+        expect([overlays?.key, spectrum?.key]).toEqual([files.key, files.key]);
+      }
+    });
+
+    it("gives null for an answer of another field: wrong key, or wrong field name", async () => {
+      const { options } = serving(wise().overlays);
+      expect(await loadRecordedOverlays("wise0855", barnard().key, options)).toBeNull();
+      expect(await loadRecordedOverlays("barnard", wise().key, options)).toBeNull();
+      const renamed = serving(synthetic_envelope(wise().overlays, { field: "barnard" }));
+      expect(await loadRecordedOverlays("wise0855", wise().key, renamed.options)).toBeNull();
+    });
+
+    it("gives null for an answer of the other route", async () => {
+      const spectrumAsOverlays = serving(wise().spectrum);
+      expect(
+        await loadRecordedOverlays("wise0855", wise().key, spectrumAsOverlays.options),
+      ).toBeNull();
+      const overlaysAsSpectrum = serving(wise().overlays);
+      expect(
+        await loadRecordedSpectrum("wise0855", wise().key, overlaysAsSpectrum.options),
+      ).toBeNull();
+      const relabelled = serving(synthetic_envelope(wise().spectrum, { route: "overlays" }));
+      expect(await loadRecordedOverlays("wise0855", wise().key, relabelled.options)).toBeNull();
+    });
+
+    it.each<[string, Record<string, unknown>]>([
+      ["another kind", { kind: "manifest" }],
+      ["no kind", { kind: undefined }],
+      ["another contract", { contract: "2.0" }],
+      ["no contract", { contract: undefined }],
+      ["no pipeline version", { pipeline_version: undefined }],
+      ["a recording time in another form", { recorded_at: "14 Nov 2026" }],
+      ["a recording time that is not a real time", { recorded_at: "2026-02-31T00:00:00Z" }],
+      ["no response", { response: undefined }],
+      ["a response of another shape", { response: { contract: "1.0", status: "ok", gaia: [] } }],
+      ["a response without the contract's key", { response: { status: "ok" } }],
+      ["no request", { request: null }],
+    ])("gives null for an overlays envelope with %s", async (_what, change) => {
+      const { options } = serving(synthetic_envelope(wise().overlays, change));
+      expect(await loadRecordedOverlays("wise0855", wise().key, options)).toBeNull();
+    });
+
+    it.each<[string, Record<string, unknown>]>([
+      ["another kind", { kind: "recorded" }],
+      ["a position off the sky", { request: { ra: 400, dec: -7.2422 } }],
+      ["no position", { request: {} }],
+      ["a state the contract does not name", { response: { status: "ok", state: "great" } }],
+    ])("gives null for a spectrum envelope with %s", async (_what, change) => {
+      const base = JSON.parse(wise().spectrum) as RecordedAnswer<"spectrum">;
+      const response =
+        "response" in change
+          ? { ...base.response, ...(change.response as Record<string, unknown>) }
+          : base.response;
+      const { options } = serving(synthetic_envelope(wise().spectrum, { ...change, response }));
+      expect(await loadRecordedSpectrum("wise0855", wise().key, options)).toBeNull();
+    });
+
+    it.each<[string, () => Response]>([
+      ["no file (404 page)", () => html(404)],
+      ["no file (404 with a body)", () => served(wise().overlays, 404)],
+      ["a static host's HTML page with status 200", () => html(200)],
+      ["malformed JSON", () => served('{"contract": "1.0", "kind": ')],
+      ["JSON that is not an object", () => served("[]")],
+    ])("gives null, never an error, for %s", async (_what, answer) => {
+      const { options } = harness(answer);
+      expect(await loadRecordedOverlays("wise0855", wise().key, options)).toBeNull();
+      expect(await loadRecordedSpectrum("wise0855", wise().key, options)).toBeNull();
+    });
+
+    it("rejects, to be asked again, when the site does not answer or answers 429 or 5xx", async () => {
+      // Not an answer about the file: the caller keeps nothing and may ask again later.
+      const { urls, sleeps, options } = harness(offline);
+      await expect(loadRecordedOverlays("wise0855", wise().key, options)).rejects.toMatchObject({
+        code: "unreachable",
+      });
+      expect(urls).toHaveLength(3);
+      expect(sleeps).toEqual([300, 900]);
+      for (const status of [429, 500, 502, 503]) {
+        const { options: failing } = serving(wise().overlays, status);
+        await expect(
+          loadRecordedOverlays("wise0855", wise().key, failing),
+          String(status),
+        ).rejects.toBeInstanceOf(FieldError);
+        await expect(
+          loadRecordedSpectrum("wise0855", wise().key, failing),
+          String(status),
+        ).rejects.toBeInstanceOf(FieldError);
+      }
+      // A 4xx is an answer about the file: there is none (R5).
+      for (const status of [403, 404, 410]) {
+        const { options: missing } = serving(wise().overlays, status);
+        expect(await loadRecordedOverlays("wise0855", wise().key, missing)).toBeNull();
+      }
+    });
+
+    /** A real recorded answer's text with its response changed: a stand-in, not real. */
+    const synthetic_response = (text: string, change: (response: Obj) => void) => {
+      const envelope = JSON.parse(text) as { response: Obj };
+      change(envelope.response);
+      return JSON.stringify(envelope);
+    };
+
+    it.each<[string, (response: Obj) => void]>([
+      ["no target", (r) => drop(r, "target")],
+      ["a target without its position", (r) => drop(r.target, "ra")],
+      ["no method", (r) => drop(r, "method")],
+      ["no neighbours", (r) => drop(r, "neighbours")],
+      ["no time span", (r) => drop(r, "time_span")],
+      ["a time span without its end", (r) => drop(r.time_span, "mjd_max")],
+      ["a point that is null", (r) => objs(r.points).push(null)],
+      ["a point without its wavelength", (r) => drop(objs(r.points)[0], "lam")],
+      ["a point of a quality the contract does not name", (r) => put(objs(r.points)[0], "fine")],
+      ["a binned value without its flux", (r) => drop(objs(r.binned)[0], "flux_ujy")],
+    ])("gives null for WISE 0855's recorded spectrum with %s", async (_what, change) => {
+      const { options } = serving(synthetic_response(wise().spectrum, change));
+      expect(await loadRecordedSpectrum("wise0855", wise().key, options)).toBeNull();
+    });
+
+    it.each<[string, (response: Obj) => void]>([
+      ["a Gaia entry that is null", (r) => objs(r.gaia).push(null)],
+      ["a Gaia source without its position", (r) => drop(objs(r.gaia)[0], "ra")],
+      ["a Gaia source without its id", (r) => drop(objs(r.gaia)[0], "source_id")],
+      ["a CatWISE source without its position", (r) => drop(objs(r.catwise)[0], "dec")],
+      [
+        "track points without their position",
+        (r) => {
+          for (const source of [...objs(r.gaia), ...objs(r.catwise)]) {
+            for (const point of objs(obj(source).track ?? [])) drop(point, "ra");
+          }
+        },
+      ],
+      ["no Gaia upstream", (r) => drop(r.upstreams, "gaia")],
+      ["an upstream state the contract does not name", (r) => put(r.upstreams, "down", "catwise")],
+    ])("gives null for a recorded overlays answer with %s", async (_what, change) => {
+      for (const files of [wise(), barnard()]) {
+        const { options } = serving(synthetic_response(files.overlays, change));
+        expect(await loadRecordedOverlays(files.name, files.key, options), files.name).toBeNull();
+      }
+    });
+
+    it("takes the real recorded responses as live answers, and refuses them broken", async () => {
+      // The response's bytes as recorded (re-serialising would turn a recorded -0.0 into 0).
+      const bytesOf = (text: string) =>
+        text.slice(text.indexOf(',"response":') + ',"response":'.length, text.lastIndexOf("}"));
+      for (const files of [wise(), barnard()]) {
+        const overlays = JSON.parse(bytesOf(files.overlays)) as Obj;
+        const spectrum = JSON.parse(bytesOf(files.spectrum)) as Obj;
+        const live = harness(() => served(bytesOf(files.overlays)));
+        expect(await loadOverlays(files.key, quiet(live.options))).toEqual(overlays);
+        const measured = harness(() => served(bytesOf(files.spectrum)));
+        expect(await loadSpectrum(files.key, 1, 2, quiet(measured.options))).toEqual(spectrum);
+        // What the page could not draw is refused at the door, live as recorded: "bad_response".
+        const nullSource = harness(() =>
+          json({ ...overlays, gaia: [...objs(overlays.gaia), null] }),
+        );
+        const noTarget = harness(() => json({ ...spectrum, target: undefined }));
+        expect((await failure(loadOverlays(files.key, quiet(nullSource.options)))).code).toBe(
+          "bad_response",
+        );
+        expect((await failure(loadSpectrum(files.key, 1, 2, quiet(noTarget.options)))).code).toBe(
+          "bad_response",
+        );
+      }
+    });
+
+    it("asks nothing for a name or a key that is not one", async () => {
+      const { urls, options } = serving(wise().overlays);
+      expect(await loadRecordedOverlays("../wise0855", wise().key, options)).toBeNull();
+      expect(await loadRecordedSpectrum("wise0855", "../status", options)).toBeNull();
+      expect(urls).toEqual([]);
+    });
+
+    it("rejects only when aborted", async () => {
+      const controller = new AbortController();
+      const { options } = harness(() => {
+        controller.abort();
+        throw new DOMException("The operation was aborted.", "AbortError");
+      });
+      await expect(
+        loadRecordedOverlays("wise0855", wise().key, { ...options, signal: controller.signal }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+    });
+  },
+);

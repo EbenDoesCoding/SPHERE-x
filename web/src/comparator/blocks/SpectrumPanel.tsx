@@ -10,9 +10,13 @@
  *        view rail holds the engine's warning notice and the whole provenance.
  * FLAGS: spectrum (off: never rendered; the ring row has no Spectrum button).
  * STATES: closed (null); loading ("Measuring…", or "Measuring 120 of 258" when the engine
- *         counts); ready (chart or table; "Indicative only: …", "A neighbour 7.5″ away may
- *         contaminate this"); saturated ("Saturated: no reliable brightness" in place of the
- *         chart); unavailable (no spectrum here, or the engine cannot measure one).
+ *         counts; no sentence while a recorded answer is read); ready (chart or table;
+ *         "Indicative only: …", "A neighbour 7.5″ away may contaminate this"); saturated
+ *         ("Saturated: no reliable brightness" in place of the chart); unavailable (no spectrum
+ *         here, or the engine cannot measure one). Any of ready, saturated and unavailable can
+ *         come from a recorded answer (extras/derive.ts, R1 to R5): then the qualifier chip
+ *         "Recorded 14 Nov 2026" (vm.extras.spectrum.recorded) sits at the end of the Download
+ *         CSV row, the only place it costs no height in the 688 px rail at 1280 × 720.
  * USES: vm.extras.spectrum, vm.extras.handlers.{setSpectrumMode,downloadCsv}, vm.layout,
  *       vm.field (band on screen, the visits' dates).
  */
@@ -391,7 +395,7 @@ export function SpectrumPanel({ vm }: { vm: ViewModel }) {
       )}
       {showChart && <Chart vm={vm} />}
       {showTable && <Table vm={vm} />}
-      <div>
+      <div className="cmp-sp-foot">
         <button
           className="bc-button"
           type="button"
@@ -400,6 +404,14 @@ export function SpectrumPanel({ vm }: { vm: ViewModel }) {
         >
           Download CSV
         </button>
+        {spectrum.recorded !== null && (
+          // A recorded answer, never a live one: the header's "Recorded field" chip, with the
+          // date. It shares the button's row, so the panel is no taller than with a live answer.
+          <span className="bc-chip bc-chip--qualifier">
+            <span className="bc-mark" />
+            {spectrum.recorded}
+          </span>
+        )}
       </div>
     </section>
   );

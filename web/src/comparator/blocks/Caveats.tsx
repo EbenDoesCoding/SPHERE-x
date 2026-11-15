@@ -4,8 +4,9 @@
  * PORTS: Main.dc.html 142–156 (foot of the time rail; a list in text-caption);
  *        Phone.dc.html 394–407 (under the playback; a list in text-label; one caveat adds the
  *        line "Details are under Provenance.").
- * FLAGS: none. Never removed with a feature. catalogueMarkers adds why markers are missing
- *        (time/rail.ts caveatList). The spectrum's own sentences stay in its panel.
+ * FLAGS: none. Never removed with a feature. catalogueMarkers adds why markers are missing, or
+ *        that the markers drawn were recorded, with the date (time/rail.ts caveatList). The
+ *        spectrum's own sentences stay in its panel.
  * STATES: one sentence: an ordinary warning notice; several: one warning notice with a list
  *         (aria-label "Caveats for this field"). Every sentence on screen, by date (the model
  *         writes "time bin 1" as the visit's dates): never collapsed, closed or truncated. At

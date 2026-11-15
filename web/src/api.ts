@@ -7,6 +7,8 @@
  * - Error answers become a `FieldError` carrying the contract's `code`.
  * - A fixture falls back to the copy bundled with the site when the API cannot be reached, so
  *   the recorded fields work with no back end at all.
+ * - A recorded field may also carry recorded answers of the overlays and spectrum routes, in the
+ *   same folder: loadRecordedOverlays and loadRecordedSpectrum read them, null when there is none.
  * - The engine answers at /api on the page's own origin, or at VITE_ENGINE_URL when that is set
  *   (an origin such as https://engine.example; .env.example). Paths stay "/api/...".
  */
@@ -544,6 +546,64 @@ function extraContext(options: ExtraOptions): Context {
   return contextOf({ ...options, onProgress: undefined });
 }
 
+// The shapes of sections 7.1 and 7.3 as the engine's models write them (api/tombaugh/models.py,
+// which refuse NaN): every field the contract names, with its type. An answer of another shape
+// is refused whole, live or recorded, so that nothing on the page reads a field that is missing.
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Each of `names` is a finite number in `item`. */
+const numbers = (item: Record<string, unknown>, ...names: string[]) =>
+  names.every((name) => typeof item[name] === "number" && Number.isFinite(item[name]));
+
+/** Each of `names` is a finite number or null in `item` (present either way). */
+const numbersOrNull = (item: Record<string, unknown>, ...names: string[]) =>
+  names.every((name) => item[name] === null || numbers(item, name));
+
+/** An array of objects that each pass `check`. */
+const listOf = (value: unknown, check: (item: Record<string, unknown>) => boolean) =>
+  Array.isArray(value) && value.every((item) => isObject(item) && check(item));
+
+const oneOf = (value: unknown, names: readonly string[]) =>
+  typeof value === "string" && names.includes(value);
+
+const UPSTREAM_STATES = ["ok", "stale", "unavailable"];
+
+/** A track of 7.3: absent, or one position per time bin. */
+const isTrack = (track: unknown) =>
+  track === undefined ||
+  track === null ||
+  listOf(track, (p) => numbers(p, "time_bin", "ra", "dec"));
+
+const isGaiaSource = (s: Record<string, unknown>) =>
+  typeof s.source_id === "string" &&
+  numbers(s, "ra", "dec", "epoch") &&
+  numbersOrNull(s, "pmra", "pmdec", "parallax", "g") &&
+  isTrack(s.track);
+
+const isCatwiseSource = (s: Record<string, unknown>) =>
+  typeof s.id === "string" &&
+  numbers(s, "ra", "dec", "epoch") &&
+  numbersOrNull(s, "pmra", "pmdec", "w1", "w2") &&
+  isTrack(s.track);
+
+/** A 200 answer of the overlays route as the contract shapes it; throws `FieldError` else. */
+function checkOverlays(body: Record<string, unknown>): OverlaysResponse {
+  const { upstreams } = body;
+  if (
+    body.status !== "ok" ||
+    !listOf(body.gaia, isGaiaSource) ||
+    !listOf(body.catwise, isCatwiseSource) ||
+    !isObject(upstreams) ||
+    !oneOf(upstreams.gaia, UPSTREAM_STATES) ||
+    !oneOf(upstreams.catwise, UPSTREAM_STATES)
+  ) {
+    throw new FieldError("bad_response", "The catalogue answer does not follow the contract.");
+  }
+  return body as unknown as OverlaysResponse;
+}
+
 /** `GET /api/fields/{key}/overlays`: Gaia DR3 and CatWISE sources of a field (section 7.3). */
 export async function loadOverlays(
   key: string,
@@ -552,24 +612,65 @@ export async function loadOverlays(
   checkKey(key);
   const context = extraContext(options);
   const url = engineUrl(`${FIELDS_URL}/${key}/overlays`, context.engine);
-  const body = await pollJson(url, context, OVERLAYS_DEADLINE_MS);
-  const upstreams = body.upstreams as Record<string, unknown> | undefined;
-  if (
-    body.status !== "ok" ||
-    !Array.isArray(body.gaia) ||
-    !Array.isArray(body.catwise) ||
-    typeof upstreams !== "object" ||
-    upstreams === null
-  ) {
-    throw new FieldError("bad_response", "The catalogue answer does not follow the contract.");
-  }
-  return body as unknown as OverlaysResponse;
+  return checkOverlays(await pollJson(url, context, OVERLAYS_DEADLINE_MS));
 }
 
 /** The `spectrum` URL of a position: decimal degrees, as many digits as given. */
 export function spectrumUrl(key: string, ra: number, dec: number): string {
   const query = new URLSearchParams({ ra: String(ra), dec: String(dec) });
   return `${FIELDS_URL}/${key}/spectrum?${query}`;
+}
+
+/** True for a position on the sky: RA in [0, 360), Dec in [-90, 90], degrees. */
+const onTheSky = (ra: number, dec: number) =>
+  Number.isFinite(ra) && ra >= 0 && ra < 360 && Number.isFinite(dec) && Math.abs(dec) <= 90;
+
+const POINT_QUALITIES = ["good", "flagged", "saturated"];
+const METHOD_KINDS = ["aperture", "joint_psf"];
+
+/** The method of 7.1: its kind and its radii, energy and floor. */
+const isMethod = (method: unknown) =>
+  isObject(method) &&
+  oneOf(method.kind, METHOD_KINDS) &&
+  numbers(method, "radius_px", "encircled_energy", "systematic_floor") &&
+  Array.isArray(method.annulus_px) &&
+  method.annulus_px.length === 2 &&
+  method.annulus_px.every((r) => typeof r === "number" && Number.isFinite(r));
+
+/** `time_span` of 7.1: null when no exposure was measured (a saturated answer has none). */
+const isTimeSpan = (span: unknown) =>
+  span === null || (isObject(span) && numbers(span, "mjd_min", "mjd_max"));
+
+const isNeighbour = (n: Record<string, unknown>) =>
+  typeof n.catalog === "string" &&
+  typeof n.id === "string" &&
+  numbers(n, "sep_arcsec") &&
+  typeof n.fitted === "boolean";
+
+const isPoint = (p: Record<string, unknown>) =>
+  numbers(p, "lam", "dlam", "mjd", "det", "time_bin", "flux_ujy", "err_ujy", "flags") &&
+  oneOf(p.quality, POINT_QUALITIES);
+
+const isBinned = (p: Record<string, unknown>) =>
+  numbers(p, "time_bin", "lam", "lam_min", "lam_max", "flux_ujy", "err_ujy", "n");
+
+/** A 200 answer of the spectrum route as the contract shapes it; throws `FieldError` else. */
+function checkSpectrum(body: Record<string, unknown>): SpectrumResponse {
+  const { target } = body;
+  if (
+    body.status !== "ok" ||
+    !oneOf(body.state, SPECTRUM_STATES) ||
+    !isObject(target) ||
+    !numbers(target, "ra", "dec") ||
+    !listOf(body.neighbours, isNeighbour) ||
+    !isMethod(body.method) ||
+    !isTimeSpan(body.time_span) ||
+    !listOf(body.points, isPoint) ||
+    !listOf(body.binned, isBinned)
+  ) {
+    throw new FieldError("bad_response", "The spectrum answer does not follow the contract.");
+  }
+  return body as unknown as SpectrumResponse;
 }
 
 /** `GET /api/fields/{key}/spectrum?ra=&dec=`: quick-look spectrophotometry (section 7.1). */
@@ -580,7 +681,7 @@ export async function loadSpectrum(
   options: ExtraOptions = {},
 ): Promise<SpectrumAnswer> {
   checkKey(key);
-  if (!Number.isFinite(ra) || ra < 0 || ra >= 360 || !Number.isFinite(dec) || Math.abs(dec) > 90) {
+  if (!onTheSky(ra, dec)) {
     throw new FieldError("bad_request", "That position is outside the sky.");
   }
   const context = extraContext(options);
@@ -589,16 +690,145 @@ export async function loadSpectrum(
   const body = await pollJson(url, context, SPECTRUM_DEADLINE_MS, options.onProgress, (answer) => {
     said.incomplete = answer.headers.get(INCOMPLETE_HEADER);
   });
-  if (
-    body.status !== "ok" ||
-    !SPECTRUM_STATES.includes(String(body.state)) ||
-    !Array.isArray(body.points) ||
-    !Array.isArray(body.binned)
-  ) {
-    throw new FieldError("bad_response", "The spectrum answer does not follow the contract.");
-  }
-  const spectrum = body as unknown as SpectrumResponse;
+  const spectrum = checkSpectrum(body);
   return said.incomplete ? { ...spectrum, incomplete: said.incomplete } : spectrum;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recorded answers: what the engine answered for a recorded field, shipped beside it
+// ---------------------------------------------------------------------------------------------
+
+/** The routes a recorded field may carry a recorded answer of: what each was asked and answered. */
+export interface RecordedRoutes {
+  overlays: { request: Record<string, never>; response: OverlaysResponse };
+  spectrum: { request: { ra: number; dec: number }; response: SpectrumResponse };
+}
+
+export type RecordedRoute = keyof RecordedRoutes;
+
+/**
+ * A real answer of the engine, recorded beside a recorded field as
+ * `cache/fixtures/<name>/overlays.json` or `spectrum.json` (docs/CONTRACT_FIELDS.md section 8,
+ * "Recorded answers"). Both files are optional. The web app's own type, kept out of contract.ts
+ * until the contract's owner takes the envelope into it.
+ */
+export interface RecordedAnswer<Route extends RecordedRoute = RecordedRoute> {
+  contract: string;
+  kind: "recorded_answer";
+  route: Route;
+  /** The recorded field's name, e.g. "wise0855". */
+  field: string;
+  /** The field's key: equal to its manifest's `key`. */
+  key: string;
+  /** The manifest's `provenance.pipeline_version`. */
+  pipeline_version: string;
+  /** When the answer was recorded: UTC, "YYYY-MM-DDTHH:MM:SSZ". */
+  recorded_at: string;
+  /** {} for overlays; for the spectrum, the manifest's request position. */
+  request: RecordedRoutes[Route]["request"];
+  /** The exact JSON body the route answered. */
+  response: RecordedRoutes[Route]["response"];
+}
+
+/** `recorded_at` is a real UTC time in one form: "2026-11-14T23:47:33Z". */
+function isRecordedAt(text: unknown): text is string {
+  if (typeof text !== "string") return false;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(text)) return false;
+  // Only a time that reads back as written is real (not 31 February, not 24:00:00).
+  const time = new Date(text);
+  return !Number.isNaN(time.getTime()) && time.toISOString() === text.replace("Z", ".000Z");
+}
+
+/** True when a recorded response passes the checks the live loader applies to the route's answer. */
+function isRouteAnswer(route: RecordedRoute, response: unknown): boolean {
+  // The live loaders take only bodies that carry the contract's key (contractBody).
+  if (!isObject(response) || typeof response.contract !== "string") return false;
+  try {
+    if (route === "overlays") checkOverlays(response);
+    else checkSpectrum(response);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The envelope when it is the recorded answer of `route` for the field `name` whose manifest key is
+ * `key` (rule R1), else null.
+ */
+function recordedEnvelope<R extends RecordedRoute>(
+  body: Record<string, unknown>,
+  route: R,
+  name: string,
+  key: string,
+): RecordedAnswer<R> | null {
+  const { contract, kind, request } = body;
+  if (typeof contract !== "string" || !contract.startsWith("1.")) return null;
+  if (kind !== "recorded_answer" || body.route !== route) return null;
+  if (body.field !== name || body.key !== key) return null;
+  if (typeof body.pipeline_version !== "string" || !isRecordedAt(body.recorded_at)) return null;
+  if (!isObject(request)) return null;
+  if (route === "spectrum") {
+    // A recorded spectrum was measured at one position, and applies only there (rule R3).
+    const { ra, dec } = request;
+    if (typeof ra !== "number" || typeof dec !== "number" || !onTheSky(ra, dec)) return null;
+  }
+  if (!isRouteAnswer(route, body.response)) return null;
+  return body as unknown as RecordedAnswer<R>;
+}
+
+/**
+ * The recorded answer of `route` shipped with the recorded field `name`, a same-origin static file
+ * (BASE_URL + "fixtures/<name>/<route>.json", copied there by scripts/sync-contract.mjs), when it
+ * belongs to the field whose manifest key is `key`: contract 1.x, kind "recorded_answer", this
+ * route, field and key, a real `recorded_at`, and a response that passes the live loader's checks.
+ *
+ * Null when there is none: a missing file (404 or another 4xx), a page that is not JSON, any
+ * envelope that fails these checks (the page then behaves as it would without the file).
+ *
+ * It rejects with a `FieldError("unreachable")` when the file could not be read this time: the
+ * site did not answer (three attempts) or answered 429 or 5xx. That is not an answer about the
+ * file, so the caller may ask again later. It rejects with the abort reason when aborted.
+ */
+async function loadRecorded<R extends RecordedRoute>(
+  route: R,
+  name: string,
+  key: string,
+  options: Pick<LoadOptions, "signal" | "fetchImpl" | "sleep"> = {},
+): Promise<RecordedAnswer<R> | null> {
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(name) || !/^[A-Za-z0-9_-]{1,64}$/.test(key)) return null;
+  const context = contextOf(options);
+  const url = `${import.meta.env.BASE_URL}fixtures/${name}/${route}.json`;
+  const unread = () => new FieldError("unreachable", "The recorded answer could not be read now.");
+  let response: Response;
+  try {
+    response = await fetchWithRetry(url, "application/json", context);
+  } catch (error) {
+    if (isAbort(error) || context.signal?.aborted) throw error;
+    throw unread();
+  }
+  if (response.status === 429 || response.status >= 500) throw unread();
+  if (!response.ok) return null;
+  const body = await contractBody(response);
+  return body === null ? null : recordedEnvelope(body, route, name, key);
+}
+
+/** The recorded overlays answer of a recorded field (contract 7.3), or null; see loadRecorded. */
+export function loadRecordedOverlays(
+  name: string,
+  key: string,
+  options: Pick<LoadOptions, "signal" | "fetchImpl" | "sleep"> = {},
+): Promise<RecordedAnswer<"overlays"> | null> {
+  return loadRecorded("overlays", name, key, options);
+}
+
+/** The recorded spectrum answer of a recorded field (contract 7.1), or null; see loadRecorded. */
+export function loadRecordedSpectrum(
+  name: string,
+  key: string,
+  options: Pick<LoadOptions, "signal" | "fetchImpl" | "sleep"> = {},
+): Promise<RecordedAnswer<"spectrum"> | null> {
+  return loadRecorded("spectrum", name, key, options);
 }
 
 /**
