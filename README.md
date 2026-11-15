@@ -39,8 +39,10 @@ Works today, on real data:
   search by name, the moved-object banner, hold to flip, side by side, the difference image, then and now,
   contrast and invert, the spotlight zoom, three-colour, the spectrum panel, catalogue markers and copy
   link. Each has a switch in `web/src/comparator/features.ts`. Checked in a browser at 1280×720, 1440×900
-  and 390×844, with the engine running and with no back end at all. Without the engine, the spectrum and
-  the catalogue markers say that they are not available; everything else works on the two recorded fields.
+  and 390×844, with the engine running and with no back end at all. Without the engine, the two recorded
+  fields show the engine's recorded answers for the catalogue markers and for the spectrum at the field's
+  centre, labelled with the date they were recorded; anywhere else those two parts say that they are not
+  available.
 
 Measured on real data on Saturday (details and limits in `docs/ENGINE_NOTES.md`):
 
